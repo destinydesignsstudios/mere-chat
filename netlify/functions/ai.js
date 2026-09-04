@@ -12,7 +12,12 @@
    at request time via process.env.GROQ_API_KEY.
    ================================================================ */
 
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+// Groq deprecated llama-3.3-70b-versatile in June 2026 (their
+// official migration recommendation is openai/gpt-oss-120b, which
+// is what's used here). If Groq deprecates this one too down the
+// line, the fix is just changing this one string -- check
+// console.groq.com/docs/models for whatever's current.
+const GROQ_MODEL = 'openai/gpt-oss-120b';
 
 exports.handler = async function (event) {
   if (event.httpMethod !== 'POST') {
