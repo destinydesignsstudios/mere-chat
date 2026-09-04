@@ -375,16 +375,58 @@ a{color:var(--accent);}
 .icon-btn:hover{background:var(--surface2);color:var(--accent);}
 
 .chat-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:4px;}
-.msg-row{display:flex;margin-bottom:6px;max-width:78%;}
+.msg-row{display:flex;margin-bottom:6px;max-width:78%;position:relative;touch-action:pan-y;}
 .msg-row.out{align-self:flex-end;flex-direction:row-reverse;}
 .msg-bubble{padding:10px 14px;border-radius:16px;font-size:0.87rem;line-height:1.45;position:relative;}
 .msg-row.in .msg-bubble{background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px;}
 .msg-row.out .msg-bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
   border-bottom-right-radius:4px;}
+.msg-bubble.pressing{filter:brightness(0.92);}
+.msg-bubble code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.85em;
+  background:rgba(0,0,0,0.08);padding:1px 4px;border-radius:4px;}
+.msg-row.out .msg-bubble code{background:rgba(255,255,255,0.2);}
+
+/* Rendered by formatMessageContent() when the AI (or a pasted
+   message) contains a markdown pipe table -- real <table> instead
+   of raw "| a | b |" text, which is unreadable in a narrow bubble. */
+.msg-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:6px 0;}
+.msg-table{border-collapse:collapse;font-size:0.78rem;min-width:100%;}
+.msg-table th,.msg-table td{border:1px solid rgba(0,0,0,0.15);padding:4px 9px;text-align:left;white-space:nowrap;}
+.msg-table th{background:rgba(0,0,0,0.06);font-weight:600;}
+.msg-row.out .msg-table th,.msg-row.out .msg-table td{border-color:rgba(255,255,255,0.35);}
+.msg-row.out .msg-table th{background:rgba(255,255,255,0.15);}
 .msg-meta{display:flex;align-items:center;gap:4px;margin-top:4px;font-size:0.65rem;opacity:0.75;}
 .msg-row.out .msg-meta{justify-content:flex-end;}
 .msg-ticks{font-size:0.72rem;}
 .msg-ticks.read{color:#38bdf8;}
+
+/* Swipe-to-reply reveal icon -- sits underneath the bubble at the
+   row's own left edge; as onMsgPointerMove() drags the bubble to
+   the right via a CSS transform (which only affects paint, not
+   layout), this becomes visible in the gap left behind. Works the
+   same way for both .in and .out rows since it's positioned
+   relative to the row, not the bubble. See initMessageGestures(). */
+.msg-swipe-icon{position:absolute;left:0;top:50%;transform:translateY(-50%);width:26px;height:26px;
+  border-radius:50%;background:var(--surface2);color:var(--accent);display:flex;align-items:center;
+  justify-content:center;font-size:0.72rem;opacity:0;pointer-events:none;}
+
+/* Quoted-message block shown inside a bubble when the message is a
+   reply (m.replyTo) -- see renderMessageRowHTML(). */
+.msg-reply-quote{display:flex;flex-direction:column;gap:1px;padding:5px 8px;margin-bottom:6px;
+  border-radius:8px;border-left:3px solid var(--accent);background:rgba(0,0,0,0.06);font-size:0.78rem;}
+.msg-row.out .msg-reply-quote{background:rgba(255,255,255,0.18);border-left-color:#fff;}
+.msg-reply-quote-label{font-weight:600;opacity:0.9;}
+.msg-reply-quote-text{opacity:0.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+/* Bar shown above the input while composing a reply -- see
+   startReply()/cancelReply(). */
+.reply-preview-bar{display:flex;align-items:center;gap:10px;padding:8px 18px;background:var(--surface2);
+  border-top:1px solid var(--border);}
+.reply-preview-bar.hidden{display:none;}
+.reply-preview-bar-accent{width:3px;align-self:stretch;border-radius:2px;background:var(--accent);}
+.reply-preview-bar-body{flex:1;min-width:0;}
+.reply-preview-bar-label{font-size:0.78rem;font-weight:600;color:var(--accent);}
+.reply-preview-bar-text{font-size:0.8rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 
 .typing-row{display:flex;align-items:center;gap:5px;padding:10px 14px;background:var(--surface);
   border:1px solid var(--border);border-radius:16px;border-bottom-left-radius:4px;width:fit-content;
@@ -1113,7 +1155,7 @@ a{color:var(--accent);}
 
         <div class="dev-footer">
           <div class="dev-stack">
-            <span class="dev-chip">Firebase</span><span class="dev-chip">Gemini AI</span><span class="dev-chip">HTML5</span>
+            <span class="dev-chip">Firebase</span><span class="dev-chip">Groq AI</span><span class="dev-chip">HTML5</span>
             <span class="dev-chip">CSS3</span><span class="dev-chip">Vanilla JS</span><span class="dev-chip">Capacitor</span>
           </div>
           <div class="dev-heart">Built with <i class="fa-solid fa-heart" style="color:#E11D48;"></i> by Destiny & Kuroh</div>
@@ -1190,6 +1232,17 @@ a{color:var(--accent);}
   </div>
 
   <div class="chat-messages" id="chatMessages"></div>
+
+  <!-- Shown when replying to a message (see startReply()/cancelReply()).
+       Hidden by default; sendMessage() clears it after sending. -->
+  <div class="reply-preview-bar hidden" id="replyPreviewBar">
+    <div class="reply-preview-bar-accent"></div>
+    <div class="reply-preview-bar-body">
+      <div class="reply-preview-bar-label" id="replyPreviewLabel">Replying to</div>
+      <div class="reply-preview-bar-text" id="replyPreviewText"></div>
+    </div>
+    <button class="icon-btn" onclick="cancelReply()" aria-label="Cancel reply"><i class="fa-solid fa-xmark"></i></button>
+  </div>
 
   <div class="chat-input-bar">
     <button class="icon-btn" onclick="openAttachmentPicker()" aria-label="Attach file or photo"><i class="fa-solid fa-paperclip"></i></button>
@@ -1449,6 +1502,7 @@ const APP = {
   pendingOtp: null,    // { code, mode: 'signup', draftUser }
   darkMode: false,
   theme: 'indigo',
+  replyingTo: null,    // { text, senderName } -- set by startReply(), read/cleared by sendMessage()
 };
 
 // "Mere AI" -- always-available Gemini assistant contact (see the
@@ -1469,7 +1523,7 @@ let CONTACTS = LOCAL_MODE
 // Dummy seed messages per contact so the chat UI has something to show.
 const SEED_MESSAGES = {
   mereai: [
-    { from: 'them', text: "Hi, I'm Mere AI. Ask me anything -- real Gemini-powered replies are coming in Phase 2.", ticks: null, time: 'Just now' },
+    { from: 'them', text: "Hi, I'm Mere AI 👋 Ask me anything, including questions about the Mere app itself.", ticks: null, time: 'Just now' },
   ],
   kuroh: [
     { from: 'them', text: 'Hey, the sidebar collapse looks great.', ticks: null, time: '9:41 AM' },
@@ -1506,6 +1560,18 @@ function chatIdFor(uidA, uidB) { return [uidA, uidB].sort().join('_'); }
 // backend counterpart to message).
 function isRealChat(contactId) {
   return !LOCAL_MODE && contactId !== 'mereai' && !!APP.user && !APP.user.id.startsWith('demo_');
+}
+
+// Same real-account requirement as isRealChat(), but for the Mere AI
+// thread specifically -- isRealChat() deliberately excludes 'mereai'
+// (it's not a second real user to message over the two-party
+// messages/typing collections), so this is what decides whether the
+// AI conversation gets persisted to Firestore (survives a refresh,
+// syncs across browsers/devices) or falls back to the original
+// session-only in-memory behaviour for local/demo mode, where
+// there's no real backend to persist against.
+function canPersistAi() {
+  return !LOCAL_MODE && !!APP.user && !APP.user.id.startsWith('demo_');
 }
 
 // Mere is built for two people, so Together (Watch Together +
@@ -1587,6 +1653,75 @@ function escapeHtml(str) {
   const d = document.createElement('div');
   d.textContent = str == null ? '' : String(str);
   return d.innerHTML;
+}
+
+// Turns WhatsApp-style inline markers into HTML for display in a
+// message bubble: *bold*, _italic_, ~strikethrough~, and ```code```.
+// Always escapes first -- this is the only safe way to call it, so
+// never feed it pre-escaped or already-trusted HTML. Order matters:
+// code runs first so markers *inside* a code span aren't touched,
+// then bold, then italic, then strikethrough. Trailing newlines
+// (from Shift+Enter in the composer) become <br> so multi-line
+// messages actually display as multiple lines.
+function formatMessageText(text) {
+  let safe = escapeHtml(text);
+  safe = safe.replace(/```([^`]+)```/g, '<code>$1</code>');
+  safe = safe.replace(/\*([^*\n]+)\*/g, '<strong>$1</strong>');
+  safe = safe.replace(/_([^_\n]+)_/g, '<em>$1</em>');
+  safe = safe.replace(/~([^~\n]+)~/g, '<s>$1</s>');
+  return safe.replace(/\n/g, '<br>');
+}
+
+// Short, ellipsis-truncated plain-text snippet -- used for the
+// quoted-message preview in both the reply bar and inside a bubble
+// that's replying to something. Deliberately plain text (escaped by
+// the caller), not formatted, matching how WhatsApp's own reply
+// snippets don't re-render bold/italic either.
+function truncateText(str, maxLen) {
+  const s = str == null ? '' : String(str);
+  return s.length > maxLen ? s.slice(0, maxLen).trimEnd() + '…' : s;
+}
+
+// Detects GitHub-flavored markdown tables (the format the AI is
+// told to use for tabular data -- see SYSTEM_PROMPT in
+// netlify/functions/ai.js) and renders them as a real HTML <table>
+// instead of raw pipe characters, which are unreadable in a narrow
+// chat bubble. Everything that isn't part of a table block still
+// goes through formatMessageText() for *bold*/_italic_/etc, so this
+// is what renderMessageRowHTML() calls instead of calling
+// formatMessageText() directly.
+function formatMessageContent(text) {
+  const lines = String(text == null ? '' : text).split('\n');
+  const isTableRow = line => /^\s*\|.*\|\s*$/.test(line);
+  const isSeparatorRow = line => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
+  const splitCells = line => line.split('|').map(c => c.trim()).filter((c, idx, arr) => !(idx === 0 && c === '') && !(idx === arr.length - 1 && c === ''));
+
+  let html = '';
+  let textBuf = [];
+  const flushText = () => {
+    if (textBuf.length) { html += formatMessageText(textBuf.join('\n')); textBuf = []; }
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    if (isTableRow(lines[i]) && isSeparatorRow(lines[i + 1] || '')) {
+      flushText();
+      const headerCells = splitCells(lines[i]);
+      i += 2; // skip header + separator row
+      const rows = [];
+      while (i < lines.length && isTableRow(lines[i])) { rows.push(splitCells(lines[i])); i++; }
+      html += '<div class="msg-table-wrap"><table class="msg-table"><thead><tr>'
+        + headerCells.map(c => `<th>${formatMessageText(c)}</th>`).join('')
+        + '</tr></thead><tbody>'
+        + rows.map(r => '<tr>' + r.map(c => `<td>${formatMessageText(c)}</td>`).join('') + '</tr>').join('')
+        + '</tbody></table></div>';
+    } else {
+      textBuf.push(lines[i]);
+      i++;
+    }
+  }
+  flushText();
+  return html;
 }
 
 function toast(message, type = 'info') {
@@ -1956,6 +2091,8 @@ function renderContacts() {
 
 let activeMessagesUnsub = null;
 let activeTypingUnsub = null;
+let activeAiMessagesUnsub = null;
+let aiPendingTrigger = null; // id of the last 'me' aiMessages doc we've already triggered a reply for, so the listener doesn't ask the AI twice for the same message
 let typingDebounceTimer = null;
 
 function openChat(contactId) {
@@ -1969,6 +2106,7 @@ function openChat(contactId) {
   }
   if (activeMessagesUnsub) { activeMessagesUnsub(); activeMessagesUnsub = null; }
   if (activeTypingUnsub) { activeTypingUnsub(); activeTypingUnsub = null; }
+  if (activeAiMessagesUnsub) { activeAiMessagesUnsub(); activeAiMessagesUnsub = null; }
   clearTimeout(typingDebounceTimer);
 
   APP.activeContact = contactId;
@@ -2001,6 +2139,10 @@ function openChat(contactId) {
     subscribeToMessages(contactId);
     subscribeToTyping(contactId);
     subscribeHighFives(contactId); // keeps the header badge + Together count in sync with this contact
+  } else if (contactId === 'mereai' && canPersistAi()) {
+    MESSAGE_LOG[contactId] = MESSAGE_LOG[contactId] || [];
+    renderMessages(); // show whatever's cached instantly; the snapshot below refines it
+    subscribeToAiMessages();
   } else {
     if (!MESSAGE_LOG[contactId]) MESSAGE_LOG[contactId] = [...(SEED_MESSAGES[contactId] || [])];
     renderMessages();
@@ -2037,6 +2179,7 @@ function subscribeToMessages(contactId) {
           text: d.content,
           ticks: mine ? ticks : null,
           time: d.createdAt ? d.createdAt.toDate().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '',
+          replyTo: d.replyTo || null,
         });
         if (!mine) {
           if (!d.deliveredAt) toDeliver.push(doc.id);
@@ -2054,6 +2197,47 @@ function subscribeToMessages(contactId) {
       toRead.forEach(id => db.collection('messages').doc(id)
         .update({ readAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(() => {}));
     }, err => { console.warn('Mere: messages listener failed', err); toast('Could not load messages.', 'error'); });
+}
+
+// Real-time Mere AI thread, mirroring subscribeToMessages() but
+// scoped to this user's own aiMessages docs -- there's no second
+// participant, so none of the chatId/typing/delivery-receipt
+// machinery above is needed. This is what makes the AI conversation
+// survive a page refresh and show up the same on a different
+// browser or device -- it previously lived only in the in-memory
+// MESSAGE_LOG, reset every page load.
+function subscribeToAiMessages() {
+  activeAiMessagesUnsub = db.collection('aiMessages')
+    .where('userId', '==', APP.user.id)
+    .orderBy('createdAt', 'asc')
+    .onSnapshot(snap => {
+      const docs = [];
+      let lastMineId = null, answered = true;
+      snap.forEach(doc => {
+        const d = doc.data();
+        docs.push({
+          from: d.from,
+          text: d.text,
+          ticks: d.from === 'me' ? 'read' : null,
+          time: d.createdAt ? d.createdAt.toDate().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '',
+          replyTo: d.replyTo || null,
+        });
+        if (d.from === 'me') { lastMineId = doc.id; answered = false; }
+        else if (d.from === 'them') { answered = true; }
+      });
+      MESSAGE_LOG['mereai'] = docs;
+      if (APP.activeContact === 'mereai') renderMessages();
+      renderContacts();
+      // If the newest message is a user message that hasn't been
+      // answered yet, and we haven't already kicked off a reply for
+      // this exact doc, ask the AI now. This also covers a message
+      // sent from a different browser/device -- not just the one
+      // that sent it -- since every open session gets this snapshot.
+      if (lastMineId && !answered && aiPendingTrigger !== lastMineId) {
+        aiPendingTrigger = lastMineId;
+        askMereAi();
+      }
+    }, err => console.warn('Mere: AI messages listener failed', err));
 }
 
 // Mirrors the typing/{chatId} doc's flag for the OTHER participant
@@ -2151,10 +2335,18 @@ function renderMessageRowHTML(m, index, animate) {
          <i class="fa-solid fa-check-double tick-double"></i>
        </span>`
     : '';
+  const replyQuote = m.replyTo
+    ? `<div class="msg-reply-quote">
+         <span class="msg-reply-quote-label">${escapeHtml(m.replyTo.senderName)}</span>
+         <span class="msg-reply-quote-text">${escapeHtml(truncateText(m.replyTo.text, 80))}</span>
+       </div>`
+    : '';
   return `
     <div class="msg-row ${m.from === 'me' ? 'out' : 'in'} ${animate ? 'msg-anim' : ''}" data-msg-index="${index}">
+      <span class="msg-swipe-icon"><i class="fa-solid fa-reply"></i></span>
       <div class="msg-bubble">
-        ${escapeHtml(m.text)}
+        ${replyQuote}
+        ${formatMessageContent(m.text)}
         <div class="msg-meta"><span>${escapeHtml(m.time)}</span>${tick}</div>
       </div>
     </div>`;
@@ -2205,11 +2397,148 @@ function showTypingRow() {
 }
 function hideTypingRow() { document.getElementById('typingRow')?.remove(); }
 
+/* ================================================================
+   REPLY-TO-MESSAGE (swipe-to-reply)
+   ------------------------------------------------------------
+   APP.replyingTo holds { text, senderName } for whatever message is
+   currently being replied to, set by startReply() (itself triggered
+   by a completed swipe -- see onMsgPointerUp() below) and read/
+   cleared by sendMessage()/sendMereAiMessage() when the reply is
+   actually sent, or by cancelReply() if the user backs out.
+   senderName is resolved once, at the moment the reply starts, into
+   a fixed display string ("You" or the contact's name) rather than
+   the relative 'me'/'them' MESSAGE_LOG uses -- that relative label
+   depends on which of the two participants is viewing it, so baking
+   in a fixed name here is what keeps the quoted preview correct on
+   both sides of the conversation once it's saved.
+   ================================================================ */
+function startReply(index) {
+  const log = MESSAGE_LOG[APP.activeContact];
+  const m = log && log[index];
+  if (!m) return;
+  const contact = CONTACTS.find(c => c.id === APP.activeContact);
+  const senderName = m.from === 'me' ? (APP.user?.username || 'You') : (contact?.name || 'Them');
+  APP.replyingTo = { text: m.text, senderName };
+  document.getElementById('replyPreviewLabel').textContent = `Replying to ${senderName}`;
+  document.getElementById('replyPreviewText').textContent = truncateText(m.text, 100);
+  document.getElementById('replyPreviewBar').classList.remove('hidden');
+  document.getElementById('chatInput')?.focus();
+}
+
+function cancelReply() {
+  APP.replyingTo = null;
+  document.getElementById('replyPreviewBar').classList.add('hidden');
+}
+
+async function copyMessageToClipboard(index) {
+  const log = MESSAGE_LOG[APP.activeContact];
+  const m = log && log[index];
+  if (!m) return;
+  try {
+    await navigator.clipboard.writeText(m.text);
+    toast('Message copied.', 'success');
+  } catch (e) {
+    toast('Could not copy message -- your browser may be blocking clipboard access.', 'error');
+  }
+}
+
+/* ================================================================
+   MESSAGE GESTURES -- swipe right to reply, hold to copy
+   ------------------------------------------------------------
+   Delegated on #chatMessages (bound once in initMessageGestures(),
+   called from the DOMContentLoaded handler at the bottom of this
+   file) rather than attached per-bubble, so it keeps working
+   automatically as messages are appended/re-rendered with no need
+   to re-bind listeners each time. Pointer Events cover touch and
+   mouse with one code path.
+
+   A single pointerdown starts both a long-press timer (copy) and
+   tracks position for a possible swipe (reply); whichever the
+   person actually does cancels the other -- see onMsgPointerMove().
+   ================================================================ */
+const SWIPE_REPLY_THRESHOLD = 44;   // px of horizontal drag needed to commit a reply
+const SWIPE_MAX_DRAG = 72;          // px cap so the bubble doesn't travel too far
+const LONG_PRESS_MS = 450;          // hold duration that triggers copy
+const GESTURE_MOVE_CANCEL_PX = 8;   // movement past this decides "this is a drag, not a hold"
+
+let msgGesture = null;
+
+function initMessageGestures() {
+  const box = document.getElementById('chatMessages');
+  if (!box || box.dataset.gesturesBound) return;
+  box.dataset.gesturesBound = '1';
+  box.addEventListener('pointerdown', onMsgPointerDown);
+  box.addEventListener('pointermove', onMsgPointerMove);
+  box.addEventListener('pointerup', onMsgPointerUp);
+  box.addEventListener('pointercancel', onMsgPointerUp);
+}
+
+function onMsgPointerDown(e) {
+  const row = e.target.closest('.msg-row');
+  if (!row) return;
+  const bubble = row.querySelector('.msg-bubble');
+  bubble?.classList.add('pressing');
+  msgGesture = {
+    row, bubble,
+    icon: row.querySelector('.msg-swipe-icon'),
+    index: Number(row.dataset.msgIndex),
+    startX: e.clientX, startY: e.clientY,
+    dragging: false,
+    pointerId: e.pointerId,
+    longPressTimer: setTimeout(() => {
+      if (!msgGesture || msgGesture.dragging) return;
+      copyMessageToClipboard(msgGesture.index);
+      msgGesture.bubble?.classList.remove('pressing');
+      msgGesture = null;
+    }, LONG_PRESS_MS),
+  };
+}
+
+function onMsgPointerMove(e) {
+  if (!msgGesture || msgGesture.pointerId !== e.pointerId) return;
+  const dx = e.clientX - msgGesture.startX;
+  const dy = e.clientY - msgGesture.startY;
+  if (!msgGesture.dragging) {
+    if (Math.abs(dx) < GESTURE_MOVE_CANCEL_PX && Math.abs(dy) < GESTURE_MOVE_CANCEL_PX) return;
+    clearTimeout(msgGesture.longPressTimer);
+    if (Math.abs(dx) <= Math.abs(dy)) {
+      // Vertical-dominant movement -- this is a scroll, not a swipe.
+      // Bail out entirely and let the browser scroll normally.
+      msgGesture.bubble?.classList.remove('pressing');
+      msgGesture = null;
+      return;
+    }
+    msgGesture.dragging = true;
+  }
+  if (dx <= 0) return; // swipe right only, like WhatsApp
+  e.preventDefault();
+  const clamped = Math.min(dx, SWIPE_MAX_DRAG);
+  msgGesture.bubble.style.transform = `translateX(${clamped}px)`;
+  if (msgGesture.icon) msgGesture.icon.style.opacity = String(Math.min(1, clamped / SWIPE_REPLY_THRESHOLD));
+}
+
+function onMsgPointerUp(e) {
+  if (!msgGesture || msgGesture.pointerId !== e.pointerId) return;
+  clearTimeout(msgGesture.longPressTimer);
+  const { bubble, icon, index, dragging } = msgGesture;
+  bubble?.classList.remove('pressing');
+  if (dragging) {
+    const dx = e.clientX - msgGesture.startX;
+    bubble.style.transition = 'transform .18s ease';
+    bubble.style.transform = 'translateX(0)';
+    if (icon) icon.style.opacity = '0';
+    setTimeout(() => { if (bubble) bubble.style.transition = ''; }, 200);
+    if (dx >= SWIPE_REPLY_THRESHOLD) startReply(index);
+  }
+  msgGesture = null;
+}
+
 function sendMessage() {
   const input = document.getElementById('chatInput');
   const text = input.value.trim();
   if (!text || !APP.activeContact) return;
   const contactId = APP.activeContact;
+  const replyTo = APP.replyingTo; // captured before cancelReply() clears it
   input.value = '';
   clearTimeout(typingDebounceTimer);
   setTypingState(false);
@@ -2222,23 +2551,26 @@ function sendMessage() {
       senderId: APP.user.id, receiverId: contactId, content: text,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       deliveredAt: null, readAt: null,
+      replyTo: replyTo || null,
     }).catch(e => toast(e.message || 'Message failed to send.', 'error'));
     // No optimistic local push here -- subscribeToMessages()'s
     // onSnapshot listener is the single source of truth and renders
     // this the moment Firestore echoes it back (near-instant thanks
     // to its local write cache).
+    cancelReply();
     return;
   }
 
   // ---- Local demo / demo-login fallback: original fake progression. ----
   const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const log = MESSAGE_LOG[contactId];
-  const msg = { from: 'me', text, ticks: 'sent', time };
+  const msg = { from: 'me', text, ticks: 'sent', time, replyTo: replyTo || null };
   log.push(msg);
   const index = log.length - 1;
   appendMessageDOM(msg, index, true);
   scrollChatToBottom();
   renderContacts();
+  cancelReply();
   setTimeout(() => updateMessageTickState(contactId, index, 'delivered'), 700);
   setTimeout(() => updateMessageTickState(contactId, index, 'read'), 1600);
 }
@@ -2272,14 +2604,30 @@ function simulateTypingDemo() {
 // MESSAGE_LOG used by local demo mode, exactly like Phase 1, just
 // with a real Gemini reply instead of a canned string.
 function sendMereAiMessage(text) {
+  const replyTo = APP.replyingTo;
+  cancelReply();
+
+  if (canPersistAi()) {
+    db.collection('aiMessages').add({
+      userId: APP.user.id, from: 'me', text,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      replyTo: replyTo || null,
+    }).catch(e => toast(e.message || 'Message failed to send.', 'error'));
+    // No optimistic local push -- subscribeToAiMessages()'s listener
+    // renders this and kicks off the AI reply once Firestore echoes
+    // it back, the same pattern real 1-1 chats use.
+    return;
+  }
+
+  // ---- Local demo fallback: no real backend to persist against. ----
   const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const log = MESSAGE_LOG['mereai'];
-  const msg = { from: 'me', text, ticks: 'read', time };
+  const msg = { from: 'me', text, ticks: 'read', time, replyTo: replyTo || null };
   log.push(msg);
   appendMessageDOM(msg, log.length - 1, true);
   scrollChatToBottom();
   renderContacts();
-  askMereAi(text);
+  askMereAi();
 }
 
 // Offline/unreachable fallbacks -- used only if the GAS endpoint
@@ -2354,13 +2702,15 @@ function buildAiHistory() {
   }));
 }
 
-async function askMereAi(prompt) {
+async function askMereAi() {
   setChatHeaderStatus('typing...', true);
   if (APP.activeContact === 'mereai') showTypingRow();
 
-  // sendMereAiMessage() already pushed the new user message into
-  // MESSAGE_LOG['mereai'] before calling this, so buildAiHistory()
-  // naturally includes it as the last entry -- this one call carries
+  // Either sendMereAiMessage() (local/demo mode) already pushed the
+  // new user message into MESSAGE_LOG['mereai'] before calling this,
+  // or subscribeToAiMessages() (persisted mode) already updated it
+  // via the Firestore snapshot -- either way buildAiHistory() picks
+  // up the new message as the last entry, so this one call carries
   // the whole recent conversation, not just the newest line.
   const history = buildAiHistory();
 
@@ -2384,9 +2734,29 @@ async function askMereAi(prompt) {
   hideTypingRow();
   const contact = CONTACTS.find(c => c.id === 'mereai');
   setChatHeaderStatus(contact.status === 'online' ? 'Online' : 'Offline', false);
+  deliverAiReply(replyText);
+}
+
+// Writes the AI's reply wherever the conversation itself lives:
+// Firestore (so it persists and syncs across a refresh/other
+// browsers) if this account can persist the thread -- see
+// canPersistAi() -- otherwise straight into the local in-memory log,
+// the same way this always worked in local/demo mode.
+function deliverAiReply(replyText) {
+  if (canPersistAi()) {
+    db.collection('aiMessages').add({
+      userId: APP.user.id, from: 'them', text: replyText,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      replyTo: null,
+    }).catch(e => toast(e.message || 'AI reply failed to save.', 'error'));
+    // No optimistic local push -- subscribeToAiMessages()'s listener
+    // renders this once Firestore echoes it back, same pattern real
+    // 1-1 chats use.
+    return;
+  }
   const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const log = MESSAGE_LOG['mereai'];
-  const msg = { from: 'them', text: replyText, ticks: null, time };
+  const msg = { from: 'them', text: replyText, ticks: null, time, replyTo: null };
   log.push(msg);
   if (APP.activeContact === 'mereai') { appendMessageDOM(msg, log.length - 1, true); scrollChatToBottom(); }
   renderContacts();
@@ -3316,6 +3686,7 @@ function wireOtpInputs() {
 document.addEventListener('DOMContentLoaded', () => {
   wireOtpInputs();
   setupKeyboardHandling();
+  initMessageGestures();
 
   // Restore saved theme / dark mode preference.
   const savedTheme = localStorage.getItem('mere_theme');
