@@ -2315,11 +2315,11 @@ function fetchWithTimeout(url, options, timeoutMs) {
 // normal JSON POST with a shorter timeout is fine, since a Netlify
 // Function has no cold-start penalty anywhere near what Apps Script
 // had.
-async function callMereAiBackend(prompt) {
+async function callMereAiBackend(history) {
   const res = await fetchWithTimeout(AI_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ messages: history }),
   }, 8000); // 8s timeout per attempt
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || ('AI backend responded with HTTP ' + res.status));
@@ -2331,21 +2331,50 @@ async function callMereAiBackend(prompt) {
 // Small sleep helper used between the first attempt and the retry.
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+// How many past turns (user+assistant messages combined) to send
+// along with each new prompt, so the AI actually has conversation
+// memory instead of treating every message as a fresh, isolated
+// chat. 20 is generous headroom for a back-and-forth chat without
+// making the request slow or expensive -- raise it if you want the
+// AI to recall further back, at the cost of a slightly larger/slower
+// request each time.
+const AI_HISTORY_LIMIT = 20;
+
+// Converts the in-memory Mere AI thread (MESSAGE_LOG['mereai']) into
+// the { role, content } shape Groq's chat API expects, keeping only
+// the most recent AI_HISTORY_LIMIT entries. 'me' -> 'user', 'them'
+// -> 'assistant'. This is what actually gives the AI memory of the
+// conversation -- every call sends the recent transcript, not just
+// the newest message.
+function buildAiHistory() {
+  const log = MESSAGE_LOG['mereai'] || [];
+  return log.slice(-AI_HISTORY_LIMIT).map(m => ({
+    role: m.from === 'me' ? 'user' : 'assistant',
+    content: m.text,
+  }));
+}
+
 async function askMereAi(prompt) {
   setChatHeaderStatus('typing...', true);
   if (APP.activeContact === 'mereai') showTypingRow();
 
+  // sendMereAiMessage() already pushed the new user message into
+  // MESSAGE_LOG['mereai'] before calling this, so buildAiHistory()
+  // naturally includes it as the last entry -- this one call carries
+  // the whole recent conversation, not just the newest line.
+  const history = buildAiHistory();
+
   let replyText;
   try {
     // First attempt.
-    replyText = await callMereAiBackend(prompt);
+    replyText = await callMereAiBackend(history);
   } catch (firstError) {
     console.warn('Mere AI request failed (attempt 1), retrying in 2s...', firstError);
     try {
       // Retry once after a short delay -- covers transient network
       // blips and Apps Script cold starts, without retrying forever.
       await wait(2000);
-      replyText = await callMereAiBackend(prompt);
+      replyText = await callMereAiBackend(history);
     } catch (secondError) {
       console.warn('Mere AI request failed (attempt 2), falling back to a local reply.', secondError);
       replyText = AI_OFFLINE_FALLBACKS[Math.floor(Math.random() * AI_OFFLINE_FALLBACKS.length)];
