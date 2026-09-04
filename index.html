@@ -1,0 +1,3338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+================================================================
+  MERE -- DEPLOYMENT INSTRUCTIONS (Netlify)
+================================================================
+1. Firebase project "mere-chat" is already wired in below (see
+   `firebaseConfig` in the <script> near the bottom). One value is
+   still a placeholder: `databaseURL` (needed for online/offline
+   presence). See the REQUIRED comment right next to it for exactly
+   where to find it in the Firebase console -- everything else
+   (auth, messaging, ticks, typing, AI chat) works without it.
+
+2. Firebase Console checklist before your first real sign-up:
+   - Authentication -> Sign-in method -> enable Email/Password.
+   - Firestore Database -> create it if you haven't already.
+   - Realtime Database -> create it, then copy its URL into
+     firebaseConfig.databaseURL (see note above).
+   - Firestore security rules -- at minimum:
+       * users/{uid}         read: any signed-in user; write: only that uid.
+       * messages/{id}       read/write only if request.auth.uid is
+                             the doc's senderId or receiverId.
+       * typing/{chatId}     read/write only if request.auth.uid is one
+                             of the two uids encoded in the id
+                             ("<uidA>_<uidB>", see chatIdFor()).
+       * emailOtps/{email}   in this build the client writes these
+                             directly, which only holds up if rules
+                             allow it -- fine for testing, but move
+                             OTP issuance to a Cloud Function before
+                             treating this as production-hardened.
+   - Realtime Database rules: /status/{uid} readable by any signed-in
+     user, writable only by that uid.
+   - Storage: not used by any shipped feature yet (see gap #1 below).
+
+3. Deploy to Netlify:
+   - Drag-and-drop this single HTML file onto app.netlify.com/drop, OR
+   - commit it as index.html in a repo and connect that repo as a new
+     Netlify site -- no build command needed, publish directory is
+     the repo root.
+   - No environment variables needed: Firebase's apiKey is meant to
+     be public (security lives in the rules above, not in hiding this
+     key), and the Gemini key stays server-side in your Apps Script
+     deployment -- it is never present in this file.
+
+4. Known gaps (out of scope for this pass -- flag if you want these
+   built next):
+   - Status posts and Together (high-fives, synced video, Vibe
+     Cannon) are still "coming soon" placeholder pages. No UI exists
+     for them yet, so nothing was wired to the `statuses` /
+     `highFives` / `syncState` collections described in the schema
+     comment further down -- that's new feature work, not a
+     config/wiring fix.
+   - OTP codes are generated client-side and written to Firestore,
+     but nothing emails them yet. Deploy the Firebase "Trigger Email
+     from Firestore" extension (or a Cloud Function) watching
+     `emailOtps`, or sign-up will work but the user never receives
+     their code by email (it still surfaces via an in-app toast so
+     you can test the flow today).
+   - A contact's message preview in the chat list only populates
+     once you've opened that chat during the current session (it's
+     driven by the same listener that renders the open thread). A
+     small always-on "last message per contact" listener would
+     remove that limitation -- didn't add it here to keep this pass
+     scoped to what was asked.
+================================================================
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#4F46E5">
+<title>Mere</title>
+
+<!-- Google Fonts: Inter (weights per spec) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<!-- Font Awesome 6 (free) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+<!-- Firebase compat SDKs (App, Auth, Firestore, Realtime Database for
+     presence, Storage). Compat build keeps everything usable from a
+     single HTML file with no bundler / module imports. All config
+     values are placeholders -- see the "FIREBASE SETUP" comment
+     block near the top of the <script> tag. -->
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
+<!-- Firebase Cloud Messaging (push notifications). See the
+     "PUSH NOTIFICATIONS" comment block further down in the script for
+     the full setup (VAPID key, service worker, Cloud Function). -->
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-messaging-compat.js"></script>
+<!-- Appwrite Web SDK -- used only for Storage (file uploads:
+     attachments, camera photos, voice notes, status media). Auth,
+     Firestore and Realtime Database above are untouched and remain
+     on Firebase; Appwrite here is scoped to Storage only. See the
+     APPWRITE_CONFIG block and uploadToAppwrite() further down in the
+     <script> tag for the full setup. -->
+<script src="https://cdn.jsdelivr.net/npm/appwrite@14.0.0/dist/umd/appwrite.min.js"></script>
+<!-- canvas-confetti: tiny library used only for the High-Five /
+     Vibe Cannon celebration burst. No config needed. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/canvas-confetti/1.9.3/confetti.browser.min.js"></script>
+
+<style>
+/* ============================================================
+   MERE -- base reset & design tokens
+   Palette / radius / shadow tokens follow the shared design
+   system used across SmartSale Pro & EduVision Pro so this app
+   feels like part of the same product family.
+   ============================================================ */
+*{margin:0;padding:0;box-sizing:border-box;-webkit-text-size-adjust:100%;text-size-adjust:100%;-webkit-tap-highlight-color:transparent;}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%;}
+
+:root{
+  --accent:#4F46E5; --accent2:#7C3AED; --accent-rgb:79,70,229;
+  --bg:#F7F7FC; --surface:#ffffff; --surface2:#F1F0FA;
+  --text:#1E1B4B; --text2:#8683AC; --border:#E4E2F1;
+  --shadow:0 1px 2px rgba(30,27,75,.04), 0 12px 32px -12px rgba(30,27,75,.14);
+  --shadow-lg:0 20px 40px -16px rgba(79,70,229,.28);
+  --radius:20px; --radius-sm:10px; --radius-lg:24px;
+  --font-sans:'Inter',system-ui,-apple-system,sans-serif;
+  --danger:#E11D48; --warn:#f59e0b; --success:#16A34A; --info:#2563EB;
+  --glass-bg:rgba(255,255,255,0.65); --glass-border:rgba(255,255,255,0.5); --glass-blur:blur(18px);
+  --topbar-h:64px; --sidebar-w:232px; --transition:0.2s cubic-bezier(.22,1,.36,1);
+}
+
+/* Dark mode -- toggled via [data-dark="true"] on <html> */
+[data-dark="true"]{
+  --bg:#100E24; --surface:#1B1838; --surface2:#232052;
+  --text:#F1F0FC; --text2:#9C99C7; --border:#322E5E;
+  --glass-bg:rgba(27,24,56,0.72); --glass-border:rgba(255,255,255,0.08);
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 32px -12px rgba(0,0,0,.5);
+}
+
+/* Theme colour variants -- set via [data-theme="..."] on <html> */
+[data-theme="indigo"]{--accent:#4F46E5;--accent2:#7C3AED;--accent-rgb:79,70,229;}
+[data-theme="blue"]{--accent:#2563EB;--accent2:#38BDF8;--accent-rgb:37,99,235;}
+[data-theme="emerald"]{--accent:#16A34A;--accent2:#34D399;--accent-rgb:22,163,74;}
+[data-theme="purple"]{--accent:#7C3AED;--accent2:#C084FC;--accent-rgb:124,58,237;}
+[data-theme="rose"]{--accent:#E11D48;--accent2:#FB7185;--accent-rgb:225,29,72;}
+[data-theme="orange"]{--accent:#EA580C;--accent2:#FBBF24;--accent-rgb:234,88,12;}
+
+body{
+  background:
+    radial-gradient(circle at 12% -10%, rgba(var(--accent-rgb),.08), transparent 45%),
+    radial-gradient(circle at 100% 0%, rgba(124,58,237,.08), transparent 40%),
+    var(--bg);
+  color:var(--text); font-family:var(--font-sans);
+  transition:background .25s ease,color .25s ease;
+  -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  min-height:100vh;
+}
+h1,h2,h3,h4{font-family:var(--font-sans);font-weight:800;letter-spacing:-0.02em;}
+button,input,select,textarea{font-family:inherit;outline:none;color:inherit;}
+input,textarea{border:1.5px solid transparent;background:var(--surface2);color:var(--text);
+  border-radius:var(--radius-sm);padding:12px 14px;font-size:0.9rem;width:100%;transition:all .2s ease;}
+input::placeholder,textarea::placeholder{color:var(--text2);}
+input:focus,textarea:focus{border-color:var(--accent);background:var(--surface);
+  box-shadow:0 0 0 4px rgba(var(--accent-rgb),.12);}
+button{cursor:pointer;border:none;background:transparent;transition:all var(--transition);}
+a{color:var(--accent);}
+::-webkit-scrollbar{width:6px;height:6px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--accent2);border-radius:99px;}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+@media (prefers-reduced-motion: reduce){*{animation-duration:0.001ms !important;animation-iteration-count:1 !important;transition-duration:0.001ms !important;}}
+
+.hidden{display:none !important;}
+
+/* Shared building blocks -------------------------------------------------*/
+.btn-gradient{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  border-radius:var(--radius-sm);font-weight:700;padding:13px 22px;font-size:0.92rem;
+  box-shadow:0 8px 20px -6px rgba(var(--accent-rgb),.5);
+  transition:transform .2s cubic-bezier(.22,1,.36,1), box-shadow .2s;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;}
+.btn-gradient:hover{transform:translateY(-2px);box-shadow:0 12px 26px -6px rgba(var(--accent-rgb),.55);}
+.btn-gradient:active{transform:translateY(0);}
+.btn-outline{border:1.5px solid var(--border);color:var(--text);background:var(--surface);
+  border-radius:var(--radius-sm);padding:12px 18px;font-weight:600;font-size:0.85rem;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;}
+.btn-outline:hover{border-color:var(--accent);color:var(--accent);}
+.btn-danger{background:var(--danger);color:#fff;border-radius:var(--radius-sm);padding:12px 20px;font-weight:700;}
+.btn-text{color:var(--accent);font-weight:600;font-size:0.85rem;}
+
+/* ============================================================
+   LOGIN SCREEN
+   ============================================================ */
+#loginScreen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  overflow:hidden;padding:20px;z-index:10;}
+.login-blob{position:absolute;border-radius:50%;filter:blur(60px);opacity:0.35;pointer-events:none;
+  animation:blobMove 14s ease-in-out infinite alternate;}
+.login-blob.b1{width:280px;height:280px;background:var(--accent);top:-100px;left:-80px;}
+.login-blob.b2{width:320px;height:320px;background:var(--accent2);bottom:-120px;right:-100px;animation-delay:2s;}
+.login-blob.b3{width:200px;height:200px;background:var(--accent2);top:40%;right:8%;animation-delay:4s;opacity:0.2;}
+@keyframes blobMove{from{transform:translate(0,0) scale(1);}to{transform:translate(30px,-20px) scale(1.15);}}
+
+.login-card{position:relative;z-index:1;width:100%;max-width:400px;background:var(--glass-bg);
+  backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border:1px solid var(--glass-border);border-radius:var(--radius-lg);
+  padding:40px 32px 32px;box-shadow:var(--shadow-lg);
+  animation:cardIn .5s cubic-bezier(.22,1,.36,1);}
+@keyframes cardIn{from{opacity:0;transform:translateY(16px) scale(.98);}to{opacity:1;transform:none;}}
+
+.login-logo{width:60px;height:60px;border-radius:18px;margin:0 auto 18px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.6rem;
+  box-shadow:0 10px 24px -6px rgba(var(--accent-rgb),.5);}
+.login-brand{font-size:1.7rem;font-weight:800;text-align:center;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  letter-spacing:-0.03em;}
+.login-tagline{text-align:center;color:var(--text2);font-size:0.85rem;margin:4px 0 26px;font-weight:500;}
+
+.fg{margin-bottom:16px;}
+.fg label{display:block;font-size:0.76rem;font-weight:600;color:var(--text2);margin-bottom:6px;}
+.pw-wrap{position:relative;}
+.pw-wrap input{padding-right:42px;}
+.pw-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);padding:8px 10px;color:var(--text2);}
+.pw-toggle:hover{color:var(--accent);}
+
+.remember-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;}
+.remember-lbl{display:flex;align-items:center;gap:10px;font-size:0.82rem;font-weight:600;color:var(--text2);}
+.switch{width:42px;height:24px;border-radius:99px;background:var(--border);position:relative;cursor:pointer;
+  transition:background var(--transition);flex-shrink:0;}
+.switch::after{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;
+  top:3px;left:3px;box-shadow:0 2px 4px rgba(0,0,0,.2);transition:transform var(--transition);}
+.switch.on{background:linear-gradient(135deg,var(--accent),var(--accent2));}
+.switch.on::after{transform:translateX(18px);}
+
+.login-btn{width:100%;}
+.divider-row{display:flex;align-items:center;gap:10px;margin:22px 0 16px;}
+.divider-row .line{flex:1;height:1px;background:var(--border);}
+.divider-row span{font-size:0.72rem;color:var(--text2);font-weight:600;}
+.demo-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.demo-btn{padding:12px;border-radius:var(--radius-sm);border:1.5px solid var(--border);
+  background:var(--surface);font-size:0.8rem;font-weight:700;color:var(--text);
+  display:flex;flex-direction:column;align-items:center;gap:6px;}
+.demo-btn i{font-size:1.05rem;color:var(--accent);}
+.demo-btn:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:var(--shadow);}
+
+.signup-row{text-align:center;margin-top:20px;font-size:0.82rem;color:var(--text2);}
+
+/* ============================================================
+   MODALS (Sign up, OTP, Logout confirm, generic)
+   ============================================================ */
+.modal-overlay{position:fixed;inset:0;background:rgba(16,14,36,0.55);backdrop-filter:blur(4px);
+  display:flex;align-items:center;justify-content:center;z-index:300;padding:20px;opacity:0;
+  pointer-events:none;transition:opacity .2s ease;}
+.modal-overlay.open{opacity:1;pointer-events:auto;}
+.modal-box{background:var(--surface);border-radius:var(--radius-lg);padding:28px 26px;
+  width:100%;max-width:400px;max-height:88vh;overflow-y:auto;box-shadow:var(--shadow-lg);
+  position:relative;transform:translateY(14px) scale(.97);transition:transform .25s cubic-bezier(.22,1,.36,1);}
+.modal-overlay.open .modal-box{transform:none;}
+.modal-close{position:absolute;top:16px;right:16px;width:32px;height:32px;border-radius:50%;
+  background:var(--surface2);display:flex;align-items:center;justify-content:center;color:var(--text2);}
+.modal-close:hover{background:var(--danger);color:#fff;}
+.modal-title{font-size:1.15rem;font-weight:800;margin-bottom:4px;}
+.modal-sub{font-size:0.82rem;color:var(--text2);margin-bottom:20px;}
+.modal-actions{display:flex;gap:10px;margin-top:20px;}
+.modal-actions button{flex:1;}
+
+.otp-row{display:flex;gap:8px;justify-content:center;margin:22px 0 10px;}
+.otp-digit{width:46px;height:56px;text-align:center;font-size:1.4rem;font-weight:800;padding:0;}
+.otp-resend{text-align:center;font-size:0.78rem;color:var(--text2);margin-top:14px;}
+
+/* ============================================================
+   APP SHELL: topbar / sidebar / bottom nav
+   ============================================================ */
+#appShell{display:none;height:100vh;flex-direction:column;}
+#appShell.active{display:flex;}
+
+.topbar{height:var(--topbar-h);flex-shrink:0;display:flex;align-items:center;justify-content:space-between;
+  padding:0 20px;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border-bottom:1px solid var(--glass-border);z-index:120;position:relative;}
+.tb-left{display:flex;align-items:center;gap:12px;}
+.hamburger{display:none;width:38px;height:38px;border-radius:12px;background:var(--surface2);
+  align-items:center;justify-content:center;font-size:1.05rem;color:var(--text);}
+.tb-brand{font-size:1.2rem;font-weight:800;letter-spacing:-0.02em;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;
+  background-clip:text;-webkit-text-fill-color:transparent;}
+.tb-right{display:flex;align-items:center;gap:12px;}
+.user-chip{display:flex;align-items:center;gap:10px;padding:6px 12px 6px 6px;border-radius:99px;
+  background:var(--surface2);cursor:pointer;}
+.avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.85rem;
+  flex-shrink:0;position:relative;}
+.avatar .status-dot{position:absolute;bottom:-1px;right:-1px;width:11px;height:11px;border-radius:50%;
+  border:2px solid var(--surface);}
+.status-dot.online{background:#22c55e;}
+.status-dot.idle{background:#f59e0b;}
+.status-dot.offline{background:#94a3b8;}
+.user-chip-name{font-size:0.85rem;font-weight:700;}
+
+.shell-body{flex:1;display:flex;overflow:hidden;position:relative;}
+
+.sidebar{width:var(--sidebar-w);flex-shrink:0;background:var(--glass-bg);backdrop-filter:var(--glass-blur);
+  -webkit-backdrop-filter:var(--glass-blur);border-right:1px solid var(--glass-border);
+  padding:16px 10px;display:flex;flex-direction:column;gap:2px;overflow-y:auto;}
+.nav-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;
+  color:var(--text2);font-weight:600;font-size:0.88rem;cursor:pointer;transition:all var(--transition);}
+.nav-item i{width:20px;text-align:center;font-size:1rem;}
+.nav-item:hover{background:var(--surface2);color:var(--text);}
+.nav-item.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  box-shadow:0 6px 16px -4px rgba(var(--accent-rgb),.5);}
+
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:150;backdrop-filter:blur(3px);}
+
+.bottom-nav{display:none;}
+.bn-item{display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:none;
+  cursor:pointer;color:var(--text2);font-size:1.1rem;padding:7px 12px;border-radius:16px;flex:1;
+  transition:all var(--transition);}
+.bn-item span{font-size:0.6rem;font-weight:700;}
+.bn-item.active{color:var(--accent);}
+.bn-item.active i{transform:translateY(-1px);}
+
+.content{flex:1;overflow-y:auto;padding:24px;}
+.page{display:none;animation:fadeUp .3s ease;}
+.page.active{display:block;height:100%;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+.page-header{margin-bottom:20px;}
+.page-title{font-size:1.35rem;font-weight:800;letter-spacing:-0.02em;}
+.page-sub{color:var(--text2);font-size:0.85rem;margin-top:2px;}
+
+@media(max-width:860px){
+  .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:160;transform:translateX(-100%);
+    width:270px;padding-top:calc(var(--topbar-h) + 12px);box-shadow:var(--shadow-lg);}
+  .sidebar.open{transform:none;}
+  .sidebar-overlay.open{display:block;}
+  .hamburger{display:flex;}
+  .bottom-nav{display:flex;position:fixed;left:10px;right:10px;bottom:10px;z-index:140;
+    background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+    border:1px solid var(--glass-border);border-radius:24px;box-shadow:var(--shadow-lg);
+    padding:8px 4px;justify-content:space-around;align-items:center;}
+  .content{padding:16px;padding-bottom:96px;}
+  .user-chip-name{display:none;}
+}
+
+/* ============================================================
+   CHATS PAGE
+   ============================================================ */
+.chat-wrap{display:flex;height:calc(100vh - var(--topbar-h) - 48px);border-radius:var(--radius-lg);
+  overflow:hidden;border:1px solid var(--border);background:var(--surface);box-shadow:var(--shadow);}
+.chat-contacts{width:290px;flex-shrink:0;border-right:1px solid var(--border);
+  display:flex;flex-direction:column;background:var(--surface);}
+.cc-header{padding:18px 18px 12px;font-weight:800;font-size:1.05rem;flex-shrink:0;}
+.cc-search{padding:0 14px 14px;flex-shrink:0;}
+.cc-search input{padding:10px 12px 10px 36px;font-size:0.82rem;background:var(--surface2);}
+.cc-search-wrap{position:relative;}
+.cc-search-wrap i{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text2);font-size:0.8rem;}
+.cc-list{flex:1;overflow-y:auto;}
+.contact-item{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;
+  border-left:3px solid transparent;transition:all var(--transition);}
+.contact-item:hover{background:var(--surface2);}
+.contact-item.active{background:var(--surface2);border-left-color:var(--accent);}
+.contact-item .avatar{width:44px;height:44px;font-size:0.95rem;}
+.contact-meta{flex:1;min-width:0;}
+.contact-name{font-weight:700;font-size:0.88rem;}
+.contact-preview{font-size:0.78rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  max-width:180px;}
+.contact-time{font-size:0.68rem;color:var(--text2);flex-shrink:0;}
+
+.chat-main{flex:1;display:flex;flex-direction:column;min-width:0;background:
+  radial-gradient(circle at 20% 0%, rgba(var(--accent-rgb),.04), transparent 40%),var(--bg);}
+.chat-header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--border);
+  background:var(--surface);flex-shrink:0;}
+.chat-header .avatar{width:40px;height:40px;}
+.chat-header-name{font-weight:700;font-size:0.95rem;}
+.chat-header-status{font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:5px;}
+.chat-header-status .status-dot{position:static;border:none;width:8px;height:8px;}
+.chat-header-actions{margin-left:auto;display:flex;gap:6px;}
+.icon-btn{width:36px;height:36px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  color:var(--text2);background:transparent;font-size:0.95rem;}
+.icon-btn:hover{background:var(--surface2);color:var(--accent);}
+
+.chat-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:4px;}
+.msg-row{display:flex;margin-bottom:6px;max-width:78%;}
+.msg-row.out{align-self:flex-end;flex-direction:row-reverse;}
+.msg-bubble{padding:10px 14px;border-radius:16px;font-size:0.87rem;line-height:1.45;position:relative;}
+.msg-row.in .msg-bubble{background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px;}
+.msg-row.out .msg-bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  border-bottom-right-radius:4px;}
+.msg-meta{display:flex;align-items:center;gap:4px;margin-top:4px;font-size:0.65rem;opacity:0.75;}
+.msg-row.out .msg-meta{justify-content:flex-end;}
+.msg-ticks{font-size:0.72rem;}
+.msg-ticks.read{color:#38bdf8;}
+
+.typing-row{display:flex;align-items:center;gap:5px;padding:10px 14px;background:var(--surface);
+  border:1px solid var(--border);border-radius:16px;border-bottom-left-radius:4px;width:fit-content;
+  margin-bottom:6px;}
+.typing-dot{width:6px;height:6px;border-radius:50%;background:var(--text2);animation:typingBounce 1.2s infinite;}
+.typing-dot:nth-child(2){animation-delay:0.15s;}
+.typing-dot:nth-child(3){animation-delay:0.3s;}
+@keyframes typingBounce{0%,60%,100%{transform:translateY(0);opacity:0.5;}30%{transform:translateY(-4px);opacity:1;}}
+
+.chat-input-bar{display:flex;align-items:flex-end;gap:10px;padding:14px 18px;border-top:1px solid var(--border);
+  background:var(--surface);flex-shrink:0;}
+.chat-input-bar textarea{resize:none;max-height:110px;min-height:44px;border-radius:var(--radius-sm);
+  font-size:0.88rem;}
+.send-btn{flex-shrink:0;padding:12px 20px;}
+.chat-empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;color:var(--text2);text-align:center;padding:40px;}
+.chat-empty-state i{font-size:2.4rem;color:var(--border);}
+
+@media(max-width:860px){
+  .chat-wrap{height:calc(100vh - var(--topbar-h) - 96px);border-radius:16px;}
+  .chat-contacts{width:100%;}
+  .chat-wrap.chat-open .chat-contacts{display:none;}
+  .chat-wrap:not(.chat-open) .chat-main{display:none;}
+  .chat-back-btn{display:flex !important;}
+}
+.chat-back-btn{display:none;}
+
+/* ============================================================
+   STATUS / TOGETHER -- placeholder pages for Phase 1
+   ============================================================ */
+.coming-soon{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  text-align:center;gap:14px;padding:60px 20px;color:var(--text2);}
+.coming-soon .cs-icon{width:70px;height:70px;border-radius:22px;
+  background:linear-gradient(135deg,rgba(var(--accent-rgb),.15),rgba(124,58,237,.12));
+  color:var(--accent);display:flex;align-items:center;justify-content:center;font-size:1.8rem;}
+.coming-soon h3{color:var(--text);font-size:1.05rem;}
+.coming-soon p{font-size:0.85rem;max-width:280px;}
+
+/* ============================================================
+   STATUS PAGE (real implementation)
+   ============================================================ */
+.status-new-btn{width:100%;margin-bottom:18px;}
+.status-timeline{display:flex;flex-direction:column;gap:14px;max-width:560px;margin:0 auto;}
+.status-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:16px;}
+.status-card-head{display:flex;align-items:center;gap:10px;margin-bottom:10px;}
+.status-card-head .avatar{width:38px;height:38px;font-size:0.85rem;}
+.status-card-name{font-weight:700;font-size:0.88rem;}
+.status-card-time{font-size:0.72rem;color:var(--text2);}
+.status-card-menu{margin-left:auto;position:relative;}
+.status-card-content{font-size:0.9rem;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
+.status-card-media{width:100%;max-height:360px;object-fit:cover;border-radius:14px;margin-top:10px;
+  background:var(--surface2);}
+.status-card-footer{display:flex;align-items:center;justify-content:space-between;margin-top:12px;}
+.status-expiry-badge{font-size:0.68rem;font-weight:700;color:var(--text2);background:var(--surface2);
+  padding:4px 10px;border-radius:99px;display:inline-flex;align-items:center;gap:5px;}
+.status-actions{display:flex;gap:6px;}
+.status-actions button{width:30px;height:30px;border-radius:10px;color:var(--text2);
+  display:flex;align-items:center;justify-content:center;background:var(--surface2);}
+.status-actions button:hover{color:var(--accent);}
+.status-actions button.danger:hover{color:var(--danger);}
+.status-empty{padding:50px 20px;}
+
+/* Status composer modal */
+.status-expiry-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0 4px;}
+.expiry-chip{padding:9px 4px;border-radius:var(--radius-sm);border:1.5px solid var(--border);
+  background:var(--surface);font-size:0.72rem;font-weight:700;color:var(--text2);text-align:center;}
+.expiry-chip.active{border-color:var(--accent);color:var(--accent);background:rgba(var(--accent-rgb),.08);}
+.status-media-preview{position:relative;margin-top:10px;border-radius:14px;overflow:hidden;display:none;}
+.status-media-preview.show{display:block;}
+.status-media-preview img{width:100%;max-height:220px;object-fit:cover;display:block;}
+.status-media-remove{position:absolute;top:8px;right:8px;width:28px;height:28px;border-radius:50%;
+  background:rgba(16,14,36,0.6);color:#fff;display:flex;align-items:center;justify-content:center;}
+.status-attach-btn{display:flex;align-items:center;gap:8px;margin-top:12px;}
+
+/* ============================================================
+   TOGETHER PAGE (Watch Together + High-Five / Vibe Cannon)
+   ============================================================ */
+.together-grid{display:flex;flex-direction:column;gap:20px;max-width:640px;margin:0 auto;}
+.together-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px;}
+.together-card-title{font-weight:800;font-size:0.98rem;display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+.together-card-title i{color:var(--accent);}
+.wt-url-row{display:flex;gap:8px;margin-bottom:12px;}
+.wt-url-row input{flex:1;}
+.wt-video-wrap{position:relative;width:100%;aspect-ratio:16/9;border-radius:14px;overflow:hidden;
+  background:#000;margin-bottom:12px;}
+#wtPlayerEl{position:absolute;inset:0;width:100%;height:100%;}
+.wt-video-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:8px;color:var(--text2);font-size:0.82rem;background:var(--surface2);}
+.wt-controls{display:flex;align-items:center;gap:10px;}
+.wt-controls .icon-btn{background:var(--surface2);width:40px;height:40px;border-radius:12px;}
+.wt-status-line{font-size:0.75rem;color:var(--text2);margin-top:8px;text-align:center;}
+
+.hf-row{display:flex;align-items:center;gap:16px;}
+.hf-button{width:76px;height:76px;border-radius:50%;flex-shrink:0;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:1.6rem;
+  display:flex;align-items:center;justify-content:center;box-shadow:0 10px 24px -6px rgba(var(--accent-rgb),.5);
+  will-change:transform;}
+.hf-button:active{transform:scale(0.92);}
+.hf-meta{flex:1;}
+.hf-count{font-size:1.6rem;font-weight:800;}
+.hf-label{font-size:0.78rem;color:var(--text2);}
+
+/* Small high-five icon button + live badge in the chat header */
+.hf-header-btn{position:relative;}
+.hf-header-badge{position:absolute;top:-2px;right:-2px;min-width:15px;height:15px;padding:0 3px;
+  border-radius:99px;background:var(--danger);color:#fff;font-size:0.55rem;font-weight:800;
+  display:flex;align-items:center;justify-content:center;line-height:1;}
+
+@media(max-width:520px){.status-expiry-grid{grid-template-columns:repeat(2,1fr);}}
+
+/* ============================================================
+   SETTINGS PAGE
+   ============================================================ */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px;margin-bottom:16px;}
+.settings-section-title{font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;
+  color:var(--text2);margin:20px 2px 10px;}
+.settings-section-title:first-of-type{margin-top:0;}
+.profile-row{display:flex;align-items:center;gap:14px;}
+.profile-row .avatar{width:52px;height:52px;font-size:1.15rem;}
+.profile-name{font-weight:800;font-size:1rem;}
+.profile-email{font-size:0.8rem;color:var(--text2);}
+.settings-row{display:flex;align-items:center;justify-content:space-between;padding:12px 2px;
+  border-bottom:1px solid var(--border);}
+.settings-row:last-child{border-bottom:none;}
+.settings-row-label{display:flex;align-items:center;gap:10px;font-size:0.87rem;font-weight:600;}
+.settings-row-label i{width:20px;text-align:center;color:var(--accent);}
+.settings-list-item{display:flex;align-items:center;gap:10px;padding:13px 2px;cursor:pointer;
+  font-size:0.87rem;font-weight:600;border-bottom:1px solid var(--border);}
+.settings-list-item:last-child{border-bottom:none;}
+.settings-list-item i:first-child{width:20px;text-align:center;color:var(--accent);}
+.settings-list-item .chev{margin-left:auto;color:var(--text2);font-size:0.75rem;}
+.theme-circles{display:flex;gap:10px;}
+.tc{width:26px;height:26px;border-radius:50%;cursor:pointer;border:2px solid transparent;
+  transition:all var(--transition);}
+.tc.active{border-color:var(--text);box-shadow:0 0 0 3px rgba(var(--accent-rgb),.25);}
+.account-field{margin-bottom:12px;}
+.account-field label{display:block;font-size:0.72rem;color:var(--text2);font-weight:700;margin-bottom:3px;
+  text-transform:uppercase;letter-spacing:0.04em;}
+.account-field .val{font-size:0.9rem;font-weight:600;}
+
+/* ============================================================
+   DEVELOPER PAGE
+   ============================================================ */
+.dev-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:760px;margin:0 auto;}
+@media(max-width:700px){.dev-grid{grid-template-columns:1fr;}}
+.dev-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+  padding:32px 24px;text-align:center;box-shadow:var(--shadow);}
+.dev-av{width:76px;height:76px;border-radius:50%;margin:0 auto 16px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  display:flex;align-items:center;justify-content:center;font-size:1.9rem;
+  box-shadow:0 10px 26px -6px rgba(var(--accent-rgb),.5);}
+.dev-name{font-size:1.1rem;font-weight:800;}
+.dev-role{font-size:0.82rem;color:var(--accent);font-weight:700;margin-top:2px;}
+.dev-contacts{margin:18px 0;text-align:left;display:flex;flex-direction:column;gap:10px;}
+.dev-con{display:flex;align-items:center;gap:10px;font-size:0.82rem;color:var(--text2);}
+.dev-con i{width:18px;text-align:center;color:var(--accent);flex-shrink:0;}
+.dev-con a{color:var(--text2);text-decoration:none;}
+.btn-wa{display:inline-flex;align-items:center;gap:8px;padding:12px 26px;border-radius:var(--radius-sm);
+  background:linear-gradient(135deg,#25d366,#128c7e);color:#fff;font-weight:700;text-decoration:none;
+  font-size:0.85rem;box-shadow:0 4px 14px rgba(37,211,102,0.35);width:100%;justify-content:center;}
+.btn-wa:hover{transform:translateY(-2px);box-shadow:0 8px 26px rgba(37,211,102,0.5);}
+.dev-footer{max-width:760px;margin:28px auto 0;text-align:center;}
+.dev-stack{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:14px;}
+.dev-chip{padding:5px 13px;border-radius:99px;background:rgba(var(--accent-rgb),0.1);color:var(--accent);
+  font-size:0.72rem;font-weight:700;border:1px solid rgba(var(--accent-rgb),0.2);}
+.dev-heart{font-size:0.8rem;color:var(--text2);}
+.dev-heart i{margin:0 3px;}
+.dev-ver{font-size:0.72rem;color:var(--text2);margin-top:6px;}
+
+/* ============================================================
+   NOTIFICATION HEADS-UP BANNER  &  TOASTS
+   ============================================================ */
+#headsUpBanner{position:fixed;top:14px;left:50%;transform:translateX(-50%) translateY(-140%);
+  width:min(380px,92vw);background:var(--glass-bg);backdrop-filter:var(--glass-blur);
+  -webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--glass-border);
+  border-radius:18px;box-shadow:var(--shadow-lg);padding:14px 16px;display:flex;gap:12px;
+  align-items:flex-start;z-index:500;transition:transform .38s cubic-bezier(.22,1,.36,1);cursor:pointer;}
+#headsUpBanner.show{transform:translateX(-50%) translateY(0);}
+#headsUpBanner .avatar{width:40px;height:40px;flex-shrink:0;}
+.hb-body{flex:1;min-width:0;}
+.hb-sender{font-weight:700;font-size:0.85rem;}
+.hb-msg{font-size:0.8rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.hb-close{color:var(--text2);flex-shrink:0;padding:4px;}
+
+.toast-wrap{position:fixed;bottom:18px;right:18px;z-index:400;display:flex;flex-direction:column;gap:10px;
+  max-width:320px;}
+@media(max-width:860px){.toast-wrap{left:12px;right:12px;bottom:96px;max-width:none;}}
+.toast{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:13px 16px;
+  box-shadow:var(--shadow-lg);display:flex;align-items:center;gap:10px;font-size:0.84rem;font-weight:600;
+  animation:toastIn .25s cubic-bezier(.22,1,.36,1);}
+@keyframes toastIn{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:none;}}
+.toast i{font-size:1rem;}
+.toast.success i{color:var(--success);}
+.toast.error i{color:var(--danger);}
+.toast.info i{color:var(--info);}
+.toast.warn i{color:var(--warn);}
+
+/* ================================================================
+   ================================================================
+   PHASE 1.5 -- MESSAGING-APP REDESIGN (WhatsApp-style)
+   ------------------------------------------------------------
+   Everything below this comment is PURELY presentational. No
+   Firebase / Auth / Firestore / Realtime DB / Gemini calls were
+   touched anywhere in this file -- only markup layout, CSS, and a
+   handful of small UI-state helper functions (open/close chat,
+   history push/pop, menu toggling) were added or reshuffled so the
+   existing backend calls keep working against the same element IDs
+   they always did (#chatMessages, #chatInput, #contactList, etc).
+   These rules are placed last on purpose: CSS cascade lets them
+   override the old desktop "split view" rules above without having
+   to delete/rewrite that older code (kept for reference / possible
+   future desktop layout, but visually superseded below).
+   ================================================================
+   ================================================================ */
+
+/* ---- Top bar (Chats List screen): "Mere" + Settings icon only.
+   The old user-chip (avatar + name pill) is hidden -- the gear
+   icon-btn a few lines earlier in the HTML already opens Settings,
+   which is where the avatar/name are shown instead. */
+.user-chip{display:none !important;}
+
+/* ---- Bottom navigation now shows exactly 4 tabs (Chats, Status,
+   Together, Developer). Settings lives only behind the top-bar gear
+   icon, matching a real messaging app (WhatsApp keeps Settings out
+   of its main tab bar too). Restyled to look like a native tab bar
+   instead of a floating pill. */
+.bottom-nav{background:var(--surface);border-top:1px solid var(--border);border-radius:0;
+  box-shadow:0 -2px 12px rgba(30,27,75,.06);}
+[data-dark="true"] .bottom-nav{box-shadow:0 -2px 12px rgba(0,0,0,.3);}
+@media(max-width:860px){
+  .bottom-nav{left:0;right:0;bottom:0;padding:6px 4px calc(6px + env(safe-area-inset-bottom));}
+}
+.bn-item{border-radius:12px;}
+
+/* ---- Chats List screen: search bar + contact list fill the whole
+   page (the old side-by-side "chat-wrap" desktop layout is retired
+   in favour of a single full-width list, which is what makes this
+   read as a phone messaging app rather than an email client). */
+#page-chats{height:100%;}
+.chat-wrap{display:block;height:100%;border:none;border-radius:0;box-shadow:none;background:transparent;}
+.chat-contacts{width:100%;height:100%;border-right:none;}
+.chat-main{display:none !important;} /* old inline chat pane -- replaced by #chatScreen overlay below */
+.cc-header{font-size:1.1rem;}
+.cc-list{scroll-behavior:smooth;will-change:transform;}
+.contact-item{will-change:transform;}
+.contact-item:active{background:var(--surface2);}
+
+/* ---- Empty state for the contacts list (no chats / no search
+   results). Reuses the same visual language as the Status/Together
+   "coming soon" empty states for consistency. */
+.list-empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:12px;color:var(--text2);text-align:center;padding:60px 30px;}
+.list-empty-state i{font-size:2.2rem;color:var(--border);}
+.list-empty-state strong{color:var(--text);font-size:0.95rem;}
+.list-empty-state span{font-size:0.82rem;}
+
+/* ================================================================
+   CHAT SCREEN -- full-screen overlay (own top bar, no bottom nav)
+   ================================================================
+   This is a position:fixed panel that sits on top of the ENTIRE app
+   shell (topbar + content + bottom-nav) whenever a chat is open, so
+   the bottom nav is fully hidden the moment you're inside a
+   conversation, exactly like a real messaging app. It reuses the
+   exact same element IDs the original Phase 1 script already reads
+   from/writes to (#chatHeaderAvatar, #chatHeaderName, #chatMessages,
+   #chatInput, etc.) -- only their position in the DOM moved, so no
+   JS logic needed to change to keep the chat working. */
+#chatScreen{position:fixed;inset:0;z-index:250;background:var(--bg);
+  display:none;flex-direction:column;will-change:transform;}
+#chatScreen.open{display:flex;}
+
+.chat-screen-header{display:flex;align-items:center;gap:10px;padding:12px 14px;
+  border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;
+  padding-top:calc(12px + env(safe-area-inset-top));}
+.chat-screen-header .chat-back-btn{display:flex;flex-shrink:0;} /* always visible here, not just <=860px */
+.chat-screen-header .avatar{width:38px;height:38px;font-size:0.85rem;flex-shrink:0;}
+.chat-screen-header-info{flex:1;min-width:0;cursor:pointer;}
+.chat-screen-header-info .chat-header-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.chat-screen-header-info .chat-header-status{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.chat-screen-header-info .chat-header-status.typing{color:var(--accent);font-weight:600;}
+
+/* 3-dot overflow menu in the chat header */
+.chat-menu-wrap{position:relative;flex-shrink:0;}
+.chat-menu{position:absolute;top:44px;right:0;background:var(--surface);border:1px solid var(--border);
+  border-radius:14px;box-shadow:var(--shadow-lg);min-width:200px;padding:6px;z-index:260;
+  display:none;flex-direction:column;}
+.chat-menu.open{display:flex;}
+.chat-menu-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;
+  font-size:0.85rem;font-weight:600;color:var(--text);text-align:left;width:100%;}
+.chat-menu-item i{width:16px;text-align:center;color:var(--text2);}
+.chat-menu-item:hover{background:var(--surface2);}
+
+#chatMessages{scroll-behavior:smooth;will-change:transform;}
+.msg-bubble{will-change:transform;}
+
+/* Typing indicator: "typing" label (real WhatsApp-style wording
+   lives in the header status, see .chat-header-status.typing above)
+   plus the animated three-dot bubble in the message stream. */
+.typing-row{align-items:center;}
+.typing-label{font-size:0.78rem;color:var(--text2);margin-right:6px;}
+
+/* Simplified send button -- icon only, circular, like a real
+   messaging app's send affordance instead of a labelled button. */
+.chat-input-bar{align-items:center;gap:8px;padding:10px 12px;
+  padding-bottom:calc(10px + env(safe-area-inset-bottom));}
+.chat-input-bar textarea{border-radius:22px;padding:11px 16px;min-height:42px;}
+.send-btn{width:42px;height:42px;padding:0;border-radius:50%;flex-shrink:0;}
+.send-btn span{display:none;} /* text label, if any, stays hidden -- icon-only */
+
+@media(max-width:860px){
+  /* Chat screen is always full-screen regardless of viewport, so no
+     special mobile override is needed here beyond what's above. */
+  .chat-back-btn{display:flex !important;}
+}
+
+/* ============================================================
+   ============================================================
+   PHASE 2 -- POLISH & MICRO-ANIMATIONS
+   ------------------------------------------------------------
+   Same append-only strategy as the Phase 1.5 block above: nothing
+   here rewrites existing rules, it only adds new ones or overrides
+   specific properties (cascade order handles the rest) so the
+   Firebase-backed logic upstream never has to change alongside it.
+   Covers: input-bar attachment icons (reuse .icon-btn, no new CSS
+   needed there), the Mere AI badge, an animated 3-dot menu, message
+   slide-in on send/receive, and a crossfade read-receipt tick.
+   ============================================================
+   ============================================================ */
+
+/* ---- Chat header name row + "AI"/"Bot" badge -------------------- */
+.chat-header-name-row{display:flex;align-items:center;gap:6px;}
+.ai-badge{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  font-size:0.6rem;font-weight:800;padding:2px 7px;border-radius:99px;text-transform:uppercase;
+  letter-spacing:0.04em;flex-shrink:0;line-height:1.5;}
+.contact-name{display:inline-flex;align-items:center;gap:6px;}
+.contact-time{display:flex;align-items:center;gap:4px;}
+.contact-mute-icon{color:var(--text2);font-size:0.7rem;}
+
+/* ---- 3-dot chat menu: fade + scale instead of an instant display
+   toggle. `display:flex` is set unconditionally here (overriding the
+   Phase-1.5 `display:none` default via cascade order) so the menu can
+   stay laid out and be animated purely with opacity/transform --
+   pointer-events:none keeps it non-interactive and untouchable while
+   closed. ---- */
+.chat-menu{display:flex;opacity:0;transform:translateY(-6px) scale(.96);pointer-events:none;
+  transition:opacity .18s ease,transform .18s cubic-bezier(.22,1,.36,1);
+  will-change:transform,opacity;transform-origin:top right;}
+.chat-menu.open{opacity:1;transform:translateY(0) scale(1);pointer-events:auto;}
+.chat-menu-divider{height:1px;background:var(--border);margin:5px 4px;flex-shrink:0;}
+.chat-menu-item.danger{color:var(--danger);}
+.chat-menu-item.danger i{color:var(--danger) !important;}
+
+/* ---- Message slide-in ------------------------------------------
+   Applied only via the .msg-anim class, which appendMessageDOM() adds
+   for a message being appended live -- the initial full-history
+   render (renderMessages()) never adds it, so opening a chat doesn't
+   replay every bubble's entrance at once. transform+opacity only, so
+   it stays on the GPU-accelerated path. ---- */
+@keyframes slideInRight{from{opacity:0;transform:translateX(24px);}to{opacity:1;transform:translateX(0);}}
+@keyframes slideInLeft{from{opacity:0;transform:translateX(-24px);}to{opacity:1;transform:translateX(0);}}
+.msg-row.msg-anim{will-change:transform,opacity;}
+.msg-row.out.msg-anim{animation:slideInRight .32s cubic-bezier(.22,1,.36,1);}
+.msg-row.in.msg-anim{animation:slideInLeft .32s cubic-bezier(.22,1,.36,1);}
+
+/* ---- Read-receipt crossfade -------------------------------------
+   Two stacked tick icons in a fixed-size box; only one is visible at
+   a time, chosen by the parent's [data-state]. updateMessageTickState()
+   flips that attribute on the EXISTING element (no re-render), which
+   is what gives the opacity transition below an old and a new state
+   to actually animate between, instead of an instant icon swap. ---- */
+.msg-ticks{position:relative;display:inline-block;width:14px;height:11px;vertical-align:-1px;}
+.msg-ticks i{position:absolute;left:0;top:0;font-size:0.72rem;line-height:1;
+  transition:opacity .35s ease,color .35s ease;will-change:opacity;}
+.msg-ticks .tick-double{opacity:0;}
+.msg-ticks[data-state="delivered"] .tick-single,
+.msg-ticks[data-state="read"] .tick-single{opacity:0;}
+.msg-ticks[data-state="delivered"] .tick-double,
+.msg-ticks[data-state="read"] .tick-double{opacity:1;}
+.msg-ticks[data-state="read"] .tick-double{color:#38bdf8;}
+
+/* ---- Typing dots: GPU hint alongside the existing Phase-1
+   keyframe animation (already transform/opacity-only). ---- */
+.typing-dot{will-change:transform,opacity;}
+
+/* ---- Mobile keyboard handling fallback --------------------------
+   setupKeyboardHandling() (see script) sets #chatScreen's inline
+   height/top from the VisualViewport API on browsers that support
+   it. `100dvh` is the CSS-only fallback for the rare browser with
+   neither -- it tracks the *dynamic* viewport (shrinks with the
+   keyboard) unlike plain `vh`, which does not. ---- */
+#chatScreen{height:100dvh;}
+</style>
+</head>
+<body data-dark="false" data-theme="indigo">
+
+<!-- ============================================================
+     LOGIN SCREEN
+     ============================================================ -->
+<div id="loginScreen">
+  <div class="login-blob b1"></div>
+  <div class="login-blob b2"></div>
+  <div class="login-blob b3"></div>
+
+  <div class="login-card">
+    <div class="login-logo"><i class="fa-solid fa-comment-dots"></i></div>
+    <div class="login-brand">Mere</div>
+    <div class="login-tagline">Just us. Nothing more.</div>
+
+    <div class="fg">
+      <label for="loginEmail">Email or Username</label>
+      <input type="text" id="loginEmail" placeholder="you@example.com" autocomplete="username">
+    </div>
+    <div class="fg">
+      <label for="loginPass">Password</label>
+      <div class="pw-wrap">
+        <input type="password" id="loginPass" placeholder="Enter your password" autocomplete="current-password"
+          onkeydown="if(event.key==='Enter')doSignIn()">
+        <button type="button" class="pw-toggle" onclick="togglePwVisibility('loginPass',this)" aria-label="Show password">
+          <i class="fa-solid fa-eye"></i>
+        </button>
+      </div>
+    </div>
+
+    <div class="remember-row">
+      <div class="remember-lbl"><i class="fa-solid fa-shield-halved" style="color:var(--accent)"></i> Remember me</div>
+      <div class="switch on" id="rememberSwitch" onclick="this.classList.toggle('on')" role="switch" aria-checked="true" aria-label="Remember me"></div>
+    </div>
+
+    <button class="btn-gradient login-btn" onclick="doSignIn()">
+      <i class="fa-solid fa-right-to-bracket"></i> Sign In
+    </button>
+
+    <div class="signup-row">
+      Don't have an account? <a href="#" class="btn-text" onclick="openSignupModal();return false;">Sign Up</a>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     SIGN UP MODAL
+     ============================================================ -->
+<div class="modal-overlay" id="signupModal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal('signupModal')" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+    <div class="modal-title">Create your account</div>
+    <div class="modal-sub">Takes less than a minute.</div>
+
+    <div class="fg"><label for="suUsername">Username</label><input type="text" id="suUsername" placeholder="Choose a username"></div>
+    <div class="fg"><label for="suEmail">Email</label><input type="email" id="suEmail" placeholder="you@example.com"></div>
+    <div class="fg">
+      <label for="suPass">Password</label>
+      <div class="pw-wrap">
+        <input type="password" id="suPass" placeholder="At least 6 characters">
+        <button type="button" class="pw-toggle" onclick="togglePwVisibility('suPass',this)" aria-label="Show password"><i class="fa-solid fa-eye"></i></button>
+      </div>
+    </div>
+    <div class="fg"><label for="suConfirm">Confirm Password</label><input type="password" id="suConfirm" placeholder="Re-enter your password"></div>
+
+    <button class="btn-gradient login-btn" onclick="doSignUp()"><i class="fa-solid fa-user-plus"></i> Create Account</button>
+  </div>
+</div>
+
+<!-- ============================================================
+     OTP VERIFICATION MODAL
+     ============================================================ -->
+<div class="modal-overlay" id="otpModal">
+  <div class="modal-box" style="text-align:center;">
+    <button class="modal-close" onclick="closeModal('otpModal')" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+    <div class="modal-title">Verify your email</div>
+    <div class="modal-sub" id="otpSubtext">Enter the 6-digit code we sent you.</div>
+
+    <div class="otp-row">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="0">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="1">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="2">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="3">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="4">
+      <input class="otp-digit" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-otp-index="5">
+    </div>
+    <div class="otp-resend">Didn't get a code? <a href="#" class="btn-text" onclick="resendOtp();return false;">Resend</a></div>
+
+    <button class="btn-gradient login-btn" style="margin-top:20px;" onclick="verifyOtp()"><i class="fa-solid fa-check"></i> Verify & Continue</button>
+  </div>
+</div>
+
+<!-- ============================================================
+     STATUS COMPOSER MODAL (create / edit a status post)
+     ============================================================ -->
+<div class="modal-overlay" id="statusModal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal('statusModal')" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+    <div class="modal-title" id="statusModalTitle">New Status</div>
+    <div class="modal-sub">Text, an optional photo, and how long it should stick around.</div>
+
+    <div class="fg">
+      <label for="statusText">What's on your mind?</label>
+      <textarea id="statusText" rows="4" placeholder="Say something..."></textarea>
+    </div>
+
+    <div class="status-attach-btn">
+      <button type="button" class="btn-outline" onclick="document.getElementById('statusImageInput').click()">
+        <i class="fa-solid fa-image"></i> Add Photo
+      </button>
+      <input type="file" id="statusImageInput" accept="image/*" class="hidden" onchange="handleStatusImagePick(event)">
+    </div>
+    <div class="status-media-preview" id="statusMediaPreview">
+      <img id="statusMediaPreviewImg" src="" alt="Status photo preview">
+      <button type="button" class="status-media-remove" onclick="removeStatusImage()" aria-label="Remove photo"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="fg" style="margin-top:16px;">
+      <label>Expires after</label>
+      <div class="status-expiry-grid" id="statusExpiryGrid">
+        <div class="expiry-chip active" data-exp="1h" onclick="setStatusExpiry('1h',this)">1 hour</div>
+        <div class="expiry-chip" data-exp="1d" onclick="setStatusExpiry('1d',this)">1 day</div>
+        <div class="expiry-chip" data-exp="1w" onclick="setStatusExpiry('1w',this)">1 week</div>
+        <div class="expiry-chip" data-exp="forever" onclick="setStatusExpiry('forever',this)">Forever</div>
+      </div>
+    </div>
+
+    <button class="btn-gradient login-btn" style="margin-top:20px;" onclick="submitStatus()" id="statusSubmitBtn">
+      <i class="fa-solid fa-paper-plane"></i> Post Status
+    </button>
+  </div>
+</div>
+
+<!-- ============================================================
+     LOGOUT CONFIRMATION MODAL
+     ============================================================ -->
+<div class="modal-overlay" id="logoutModal">
+  <div class="modal-box" style="text-align:center;">
+    <div style="width:56px;height:56px;border-radius:50%;background:rgba(225,29,72,0.1);color:var(--danger);
+      display:flex;align-items:center;justify-content:center;font-size:1.4rem;margin:0 auto 14px;">
+      <i class="fa-solid fa-right-from-bracket"></i>
+    </div>
+    <div class="modal-title">Log out of Mere?</div>
+    <div class="modal-sub">You'll need to sign in again to see your chats.</div>
+    <div class="modal-actions">
+      <button class="btn-outline" onclick="closeModal('logoutModal')">Cancel</button>
+      <button class="btn-danger" onclick="doLogout()">Log Out</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     APP SHELL
+     ============================================================ -->
+<div id="appShell">
+  <div class="topbar">
+    <div class="tb-left">
+      <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu"><i class="fa-solid fa-bars"></i></button>
+      <div class="tb-brand">Mere</div>
+    </div>
+    <div class="tb-right">
+      <button class="icon-btn" onclick="navTo('settings')" title="Settings" aria-label="Settings">
+        <i class="fa-solid fa-gear"></i>
+      </button>
+      <div class="user-chip" onclick="navTo('settings')">
+        <div class="avatar" id="topbarAvatar">--<span class="status-dot online"></span></div>
+        <div class="user-chip-name" id="topbarName">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="shell-body">
+    <div class="sidebar" id="sidebar">
+      <div class="nav-item active" data-tab="chats" onclick="navTo('chats',this)"><i class="fa-solid fa-comment-dots"></i> Chats</div>
+      <div class="nav-item" data-tab="status" onclick="navTo('status',this)"><i class="fa-solid fa-circle-notch"></i> Status</div>
+      <div class="nav-item" data-tab="together" onclick="navTo('together',this)"><i class="fa-solid fa-people-arrows"></i> Together</div>
+      <div class="nav-item" data-tab="settings" onclick="navTo('settings',this)"><i class="fa-solid fa-gear"></i> Settings</div>
+      <div class="nav-item" data-tab="developer" onclick="navTo('developer',this)"><i class="fa-solid fa-code"></i> Developer</div>
+    </div>
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
+
+    <div class="content">
+      <!-- ---------- CHATS PAGE ---------- -->
+      <div class="page active" id="page-chats">
+        <div class="chat-wrap" id="chatWrap">
+          <div class="chat-contacts">
+            <div class="cc-header">Chats</div>
+            <div class="cc-search">
+              <div class="cc-search-wrap">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <input type="text" placeholder="Search chats..." id="contactSearch" oninput="renderContacts()">
+              </div>
+            </div>
+            <div class="cc-list" id="contactList"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ---------- STATUS PAGE ---------- -->
+      <div class="page" id="page-status">
+        <div class="page-header"><div class="page-title">Status</div><div class="page-sub">Share a moment that fades after a while.</div></div>
+        <div style="max-width:560px;margin:0 auto;">
+          <button class="btn-gradient status-new-btn" onclick="openStatusComposer()">
+            <i class="fa-solid fa-plus"></i> New Status
+          </button>
+        </div>
+        <div class="status-timeline" id="statusTimeline"></div>
+      </div>
+
+      <!-- ---------- TOGETHER PAGE ---------- -->
+      <div class="page" id="page-together">
+        <div class="page-header"><div class="page-title">Together</div><div class="page-sub">Watch, sync, and send high-fives in real time.</div></div>
+        <div class="together-grid">
+
+          <!-- Watch Together -->
+          <div class="together-card">
+            <div class="together-card-title"><i class="fa-solid fa-clapperboard"></i> Watch Together</div>
+            <div class="wt-url-row">
+              <input type="text" id="wtUrlInput" placeholder="Paste a YouTube link or video ID">
+              <button class="btn-gradient" style="padding:11px 16px;" onclick="loadTogetherVideo()"><i class="fa-solid fa-play"></i></button>
+            </div>
+            <div class="wt-video-wrap">
+              <div class="wt-video-empty" id="wtEmptyState"><i class="fa-solid fa-tv" style="font-size:1.6rem;"></i>No video loaded yet</div>
+              <div id="wtPlayerEl"></div>
+            </div>
+            <div class="wt-controls">
+              <button class="icon-btn" onclick="wtTogglePlay()" id="wtPlayBtn" aria-label="Play/Pause"><i class="fa-solid fa-play"></i></button>
+              <button class="icon-btn" onclick="wtSeek(-10)" aria-label="Back 10 seconds"><i class="fa-solid fa-rotate-left"></i></button>
+              <button class="icon-btn" onclick="wtSeek(10)" aria-label="Forward 10 seconds"><i class="fa-solid fa-rotate-right"></i></button>
+              <button class="icon-btn" onclick="wtResync()" aria-label="Re-sync with partner"><i class="fa-solid fa-arrows-rotate"></i></button>
+            </div>
+            <div class="wt-status-line" id="wtStatusLine">Not synced yet.</div>
+          </div>
+
+          <!-- High-Five / Vibe Cannon -->
+          <div class="together-card">
+            <div class="together-card-title"><i class="fa-solid fa-hand-sparkles"></i> Vibe Cannon</div>
+            <div class="hf-row">
+              <button class="hf-button" onclick="sendHighFive()" aria-label="Send a high-five"><i class="fa-solid fa-hand"></i></button>
+              <div class="hf-meta">
+                <div class="hf-count" id="hfCount">0</div>
+                <div class="hf-label">high-fives sent between you two</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ---------- SETTINGS PAGE ---------- -->
+      <div class="page" id="page-settings">
+        <div class="page-header"><div class="page-title">Settings</div></div>
+
+        <div class="card profile-row">
+          <div class="avatar" id="settingsAvatar" style="width:52px;height:52px;font-size:1.15rem;">--</div>
+          <div>
+            <div class="profile-name" id="settingsName">--</div>
+            <div class="profile-email" id="settingsEmail">--</div>
+          </div>
+        </div>
+
+        <div class="settings-section-title">Appearance</div>
+        <div class="card">
+          <div class="settings-row">
+            <div class="settings-row-label"><i class="fa-solid fa-moon"></i> Dark Mode</div>
+            <div class="switch" id="darkSwitch" onclick="toggleDark()" role="switch" aria-checked="false" aria-label="Dark mode"></div>
+          </div>
+          <div class="settings-row" style="border-bottom:none;">
+            <div class="settings-row-label"><i class="fa-solid fa-palette"></i> Theme Color</div>
+            <div class="theme-circles" id="themeCircles">
+              <div class="tc active" data-t="indigo" style="background:#4F46E5" onclick="setTheme('indigo',this)" role="button" aria-label="Indigo theme"></div>
+              <div class="tc" data-t="blue" style="background:#2563EB" onclick="setTheme('blue',this)" role="button" aria-label="Blue theme"></div>
+              <div class="tc" data-t="emerald" style="background:#16A34A" onclick="setTheme('emerald',this)" role="button" aria-label="Emerald theme"></div>
+              <div class="tc" data-t="purple" style="background:#7C3AED" onclick="setTheme('purple',this)" role="button" aria-label="Purple theme"></div>
+              <div class="tc" data-t="rose" style="background:#E11D48" onclick="setTheme('rose',this)" role="button" aria-label="Rose theme"></div>
+              <div class="tc" data-t="orange" style="background:#EA580C" onclick="setTheme('orange',this)" role="button" aria-label="Orange theme"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section-title">Notifications</div>
+        <div class="card">
+          <div class="settings-row" style="border-bottom:none;">
+            <div class="settings-row-label"><i class="fa-solid fa-bell"></i> Heads-up alerts</div>
+            <button class="btn-outline" onclick="sendTestNotification()"><i class="fa-solid fa-paper-plane"></i> Send Test Notification</button>
+          </div>
+        </div>
+
+        <div class="settings-section-title">Account</div>
+        <div class="card">
+          <div class="account-field"><label>Username</label><div class="val" id="accUsername">--</div></div>
+          <div class="account-field" style="margin-bottom:0;"><label>Email</label><div class="val" id="accEmail">--</div></div>
+        </div>
+
+        <div class="card" style="padding:4px 18px;">
+          <div class="settings-list-item" style="color:var(--danger);" onclick="openModal('logoutModal')">
+            <i class="fa-solid fa-right-from-bracket" style="color:var(--danger) !important;"></i> Log Out
+            <i class="fa-solid fa-chevron-right chev"></i>
+          </div>
+        </div>
+      </div>
+
+      <!-- ---------- DEVELOPER PAGE ---------- -->
+      <div class="page" id="page-developer">
+        <div class="page-header"><div class="page-title">About the Developers</div><div class="page-sub">The two people behind Mere.</div></div>
+
+        <div class="dev-grid">
+          <div class="dev-card">
+            <div class="dev-av"><i class="fa-solid fa-user-tie"></i></div>
+            <div class="dev-name">Destiny</div>
+            <div class="dev-role">Lead Developer & Architect</div>
+            <div class="dev-contacts">
+              <div class="dev-con"><i class="fa-solid fa-envelope"></i> <a href="mailto:destinydesigns.studios@gmail.com">destinydesigns.studios@gmail.com</a></div>
+              <div class="dev-con"><i class="fa-solid fa-phone"></i> <a href="tel:+255612613745">+255 612 613 745</a></div>
+            </div>
+            <a href="https://wa.me/255612613745" target="_blank" rel="noopener" class="btn-wa"><i class="fa-brands fa-whatsapp"></i> Chat with Destiny</a>
+          </div>
+
+          <div class="dev-card">
+            <div class="dev-av"><i class="fa-solid fa-user-graduate"></i></div>
+            <div class="dev-name">Kuroh</div>
+            <div class="dev-role">Co-Creator & Product Designer</div>
+            <div class="dev-contacts">
+              <div class="dev-con"><i class="fa-solid fa-envelope"></i> <a href="mailto:Khyrakhamis@gmail.com">Khyrakhamis@gmail.com</a></div>
+              <div class="dev-con"><i class="fa-solid fa-phone"></i> <a href="tel:+255665129054">+255 665 129 054</a></div>
+            </div>
+            <a href="https://wa.me/255665129054" target="_blank" rel="noopener" class="btn-wa"><i class="fa-brands fa-whatsapp"></i> Chat with Kuroh</a>
+          </div>
+        </div>
+
+        <div class="dev-footer">
+          <div class="dev-stack">
+            <span class="dev-chip">Firebase</span><span class="dev-chip">Gemini AI</span><span class="dev-chip">HTML5</span>
+            <span class="dev-chip">CSS3</span><span class="dev-chip">Vanilla JS</span><span class="dev-chip">Capacitor</span>
+          </div>
+          <div class="dev-heart">Built with <i class="fa-solid fa-heart" style="color:#E11D48;"></i> by Destiny & Kuroh</div>
+          <div class="dev-ver">Mere v0.1 (Phase 1) &middot; Foundation Build</div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /shell-body -->
+
+  <div class="bottom-nav">
+    <button class="bn-item active" data-tab="chats" onclick="navTo('chats',this)"><i class="fa-solid fa-comment-dots"></i><span>Chats</span></button>
+    <button class="bn-item" data-tab="status" onclick="navTo('status',this)"><i class="fa-solid fa-circle-notch"></i><span>Status</span></button>
+    <button class="bn-item" data-tab="together" onclick="navTo('together',this)"><i class="fa-solid fa-people-arrows"></i><span>Together</span></button>
+    <button class="bn-item" data-tab="developer" onclick="navTo('developer',this)"><i class="fa-solid fa-code"></i><span>Developer</span></button>
+  </div>
+</div><!-- /appShell -->
+
+<!-- ============================================================
+     CHAT SCREEN -- full-screen overlay, own top bar, no bottom nav
+     ------------------------------------------------------------
+     Sits on top of the whole app shell (position:fixed, see CSS)
+     whenever a chat is open, so the bottom nav is completely
+     hidden while chatting -- exactly like a real messaging app.
+     Every element ID here (#chatHeaderAvatar, #chatHeaderName,
+     #chatMessages, #chatInput...) is unchanged from Phase 1, so
+     openChat()/sendMessage()/renderMessages() etc. keep working
+     against the SAME Firebase-backed data without any backend
+     logic being touched -- only where these elements live in the
+     page changed.
+     ============================================================ -->
+<div id="chatScreen">
+  <div class="chat-screen-header">
+    <!-- Back arrow: goes through history.back() so both this button
+         AND the hardware/browser back button share one code path
+         (see the window.onpopstate handler in the script below). -->
+    <button class="icon-btn chat-back-btn" onclick="history.back()" aria-label="Back to chats">
+      <i class="fa-solid fa-arrow-left"></i>
+    </button>
+    <div class="avatar" id="chatHeaderAvatar">--</div>
+    <div class="chat-screen-header-info">
+      <div class="chat-header-name-row">
+        <span class="chat-header-name" id="chatHeaderName">--</span>
+        <span class="ai-badge hidden" id="chatHeaderAiBadge">AI</span>
+      </div>
+      <div class="chat-header-status" id="chatHeaderStatus"><span class="status-dot online"></span><span id="chatHeaderStatusText">Online</span></div>
+    </div>
+    <!-- Sparkle shortcut: jumps into the Mere AI (Gemini) assistant
+         chat from wherever you are. Hidden while already inside that
+         chat (see openChat()) since it would just be a no-op there. -->
+    <button class="icon-btn" id="askAiBtn" onclick="openChat('mereai')" aria-label="Ask Mere AI">
+      <i class="fa-solid fa-wand-magic-sparkles"></i>
+    </button>
+    <!-- High-five shortcut, hidden in the Mere AI thread (see openChat())
+         since there's no "other person" to high-five there. -->
+    <button class="icon-btn hf-header-btn" id="hfHeaderBtn" onclick="sendHighFive()" aria-label="Send a high-five">
+      <i class="fa-solid fa-hand"></i>
+      <span class="hf-header-badge hidden" id="hfHeaderBadge">0</span>
+    </button>
+    <div class="chat-menu-wrap">
+      <button class="icon-btn" onclick="toggleChatMenu()" aria-haspopup="true" aria-label="Chat options">
+        <i class="fa-solid fa-ellipsis-vertical"></i>
+      </button>
+      <div class="chat-menu" id="chatMenu">
+        <button class="chat-menu-item" onclick="toggleChatMenu();toast('Search in chat is coming soon.','info');"><i class="fa-solid fa-magnifying-glass"></i> Search in chat</button>
+        <button class="chat-menu-item" onclick="toggleMuteContact()"><i class="fa-solid fa-bell-slash" id="muteMenuIcon"></i> <span id="muteMenuLabel">Mute notifications</span></button>
+        <button class="chat-menu-item" onclick="clearActiveChat()"><i class="fa-solid fa-trash-can"></i> Clear chat</button>
+        <div class="chat-menu-divider"></div>
+        <button class="chat-menu-item danger" onclick="toggleChatMenu();toast('Contact blocked.','warn');"><i class="fa-solid fa-ban"></i> Block contact</button>
+        <div class="chat-menu-divider"></div>
+        <button class="chat-menu-item" onclick="simulateTypingDemo();toggleChatMenu();"><i class="fa-solid fa-keyboard"></i> Preview typing indicator</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="chat-messages" id="chatMessages"></div>
+
+  <div class="chat-input-bar">
+    <button class="icon-btn" onclick="openAttachmentPicker()" aria-label="Attach file or photo"><i class="fa-solid fa-paperclip"></i></button>
+    <button class="icon-btn" onclick="openCameraCapture()" aria-label="Take photo"><i class="fa-solid fa-camera"></i></button>
+    <textarea id="chatInput" placeholder="Type a message" rows="1"
+      oninput="handleChatInputTyping()"
+      onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
+    <button class="icon-btn" onclick="startVoiceNote()" aria-label="Record voice note"><i class="fa-solid fa-microphone"></i></button>
+    <button class="btn-gradient send-btn" onclick="sendMessage()" aria-label="Send message"><i class="fa-solid fa-paper-plane"></i><span>Send</span></button>
+  </div>
+</div>
+
+<!-- ============================================================
+     NOTIFICATION HEADS-UP BANNER & TOASTS
+     ============================================================ -->
+<div id="headsUpBanner" onclick="dismissHeadsUp()">
+  <div class="avatar" id="hbAvatar">--</div>
+  <div class="hb-body">
+    <div class="hb-sender" id="hbSender">--</div>
+    <div class="hb-msg" id="hbMsg">--</div>
+  </div>
+  <button class="hb-close" onclick="event.stopPropagation();dismissHeadsUp();" aria-label="Dismiss"><i class="fa-solid fa-xmark"></i></button>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+'use strict';
+
+/* ================================================================
+   MERE -- Phase 1: Foundation, Auth, Chat Skeleton, Notifications
+   (Firebase backend)
+   ================================================================
+
+   FIRESTORE / REALTIME DATABASE SCHEMA (plan -- create these in your
+   Firebase project once you swap in a real config below):
+
+   Firestore collection: users/{uid}
+     username        string
+     email           string
+     avatarUrl       string (nullable)
+     onlineStatus    string        -- 'online' | 'idle' | 'offline'
+                                       (mirrored from Realtime DB presence;
+                                       see /status/{uid} below)
+     lastSeen        timestamp
+
+   Firestore collection: messages/{messageId}
+     senderId        string (uid)
+     receiverId      string (uid)
+     content         string
+     createdAt       timestamp (serverTimestamp())
+     deliveredAt     timestamp (nullable)
+     readAt          timestamp (nullable)
+
+   Firestore collection: statuses/{statusId}
+     userId          string (uid)
+     content         string
+     mediaUrl        string (nullable)   -- Firebase Storage download URL
+     createdAt       timestamp (serverTimestamp())
+     expiresAt       timestamp
+
+   Firestore collection: highFives/{docId}
+     senderId        string (uid)
+     receiverId      string (uid)
+     count           number (default 0)
+
+   Firestore collection: syncState/{uid}
+     videoId         string
+     timestamp       number        -- playback position in seconds
+     isPlaying       boolean
+
+   Firestore collection: emailOtps/{email}   (sign-up verification)
+     code            string  -- 6 digits
+     username        string
+     createdAt       timestamp
+     expiresAt       timestamp
+     NOTE: Firebase Auth has no built-in 6-digit email OTP (unlike
+     Supabase). The pattern here is: generate a code client-side,
+     write it to this collection, then have a Firebase Extension
+     ("Trigger Email from Firestore") or a Cloud Function watch the
+     collection and email the code to the user. Until that function
+     is deployed, real-mode sign-up will store the code but nothing
+     will physically email it -- wire up the Extension/Function
+     before shipping. Local demo mode (see below) bypasses this
+     entirely and just shows the code via toast.
+
+   Realtime Database presence tree: /status/{uid}
+     state           string   -- 'online' | 'offline'
+     lastChanged     timestamp
+     Uses the standard Firebase onDisconnect() presence pattern so a
+     user's dot flips to offline the moment their connection drops,
+     even on a crash (no clean logout required).
+
+   Firebase Storage bucket path: avatars/{uid}, status-media/{uid}/{file}
+
+   ================================================================
+   FIREBASE SETUP
+   ================================================================
+   The real "mere-chat" project config is filled in below. One field
+   -- databaseURL -- is still a placeholder because it wasn't part of
+   the copy-paste config block Firebase gives you; see the REQUIRED
+   comment next to it for where to find it. Everything else (auth,
+   Firestore messaging, ticks, typing, AI chat) runs for real without
+   it -- only presence (online/offline dots) stays disabled until
+   it's set.
+
+   If firebaseConfig.apiKey/projectId are ever reset back to the
+   'YOUR_...' placeholders (e.g. testing on a machine without the
+   real keys), Mere automatically falls back to "local demo mode":
+   auth, OTP, and chat all work against localStorage instead of a
+   live backend, so the whole app stays fully clickable either way.
+   ================================================================ */
+const firebaseConfig = {
+  apiKey: 'AIzaSyD3rpgy0uVwUGsZKEh6lHQHXpvcTTVrFQs',
+  authDomain: 'mere-chat.firebaseapp.com',
+  projectId: 'mere-chat',
+  storageBucket: 'mere-chat.firebasestorage.app',
+  messagingSenderId: '507244072311',
+  appId: '1:507244072311:web:d78283659b111fd7b62572',
+  // REQUIRED for presence (online/offline dots) to work, and NOT
+  // included in the config Kuroh pasted in. Open Firebase Console ->
+  // Build -> Realtime Database (create the database first if it
+  // doesn't exist yet), then copy the URL shown at the top of that
+  // page -- it looks like
+  // https://mere-chat-default-rtdb.<region>.firebasedatabase.app or
+  // https://mere-chat-default-rtdb.firebaseio.com -- and paste it
+  // here. Until this is a real URL, Mere runs with presence disabled
+  // (contacts just won't show live online/offline status) but every
+  // other feature below -- auth, messaging, ticks, typing, AI chat --
+  // still works normally.
+  databaseURL: 'https://mere-chat-default-rtdb.europe-west1.firebasedatabase.app',
+};
+
+/* ================================================================
+   APPWRITE SETUP (Storage only)
+   ------------------------------------------------------------
+   Mere stores every uploaded file (chat attachments, camera
+   photos, voice notes, and status media) in Appwrite Storage
+   instead of Firebase Storage. Firebase Auth, Firestore and
+   Realtime Database above are completely untouched -- this is the
+   only backend that changed.
+
+   This client only ever calls .setEndpoint() and .setProject() --
+   no API key. Browser-side Appwrite SDKs cannot authenticate with
+   .setKey(); that method is for trusted server code only (Apps
+   Script, Cloud Functions, etc.) and silently produces a client
+   that isn't actually authorized to do anything, which is why
+   uploads were failing. Instead, the signed-in Firebase user's
+   upload is authorized entirely by the Storage bucket's own
+   permission settings in the Appwrite console (see setup steps
+   provided alongside this file). Because there's no key here
+   anymore, there's nothing in this file's source that needs to
+   stay secret.
+   ================================================================ */
+const APPWRITE_CONFIG = {
+  endpoint: 'https://fra.cloud.appwrite.io/v1',
+  projectId: '6a995b59000327c8deb2',
+  bucketId: '6a995b92003a7976c8e7',
+};
+// Guarded the same way FIREBASE_CONFIGURED is above, so a page that
+// still has placeholder Appwrite values doesn't throw on load --
+// upload calls just fail gracefully with a toast instead.
+const APPWRITE_CONFIGURED = !!APPWRITE_CONFIG.projectId && !!APPWRITE_CONFIG.bucketId;
+let appwriteClient = null, appwriteStorage = null;
+if (APPWRITE_CONFIGURED && window.Appwrite) {
+  try {
+    appwriteClient = new Appwrite.Client()
+      .setEndpoint(APPWRITE_CONFIG.endpoint)
+      .setProject(APPWRITE_CONFIG.projectId);
+    appwriteStorage = new Appwrite.Storage(appwriteClient);
+  } catch (e) {
+    console.warn('Appwrite failed to initialize -- file uploads (attachments, camera, voice notes, status media) will be unavailable.', e);
+  }
+}
+
+// Uploads a single File/Blob to the configured Appwrite Storage
+// bucket and returns a public view URL for it. 'unique()' tells
+// Appwrite to generate the file's ID for us, same as Firebase's
+// auto-generated Storage paths did before. Used by saveStatus() /
+// submitStatus(), openAttachmentPicker(), openCameraCapture(), and
+// startVoiceNote() -- i.e. every place that used to call
+// storage.ref(...).put(...).getDownloadURL() on Firebase Storage.
+// This relies entirely on the bucket permissions set in the
+// Appwrite console (Create access for logged-in users, Read access
+// so recipients can view shared media) -- no key or per-file
+// permissions array needed on this end.
+async function uploadToAppwrite(file) {
+  if (!appwriteStorage) throw new Error('Appwrite Storage is not configured.');
+  const response = await appwriteStorage.createFile(
+    APPWRITE_CONFIG.bucketId,
+    'unique()',
+    file
+  );
+  return `https://fra.cloud.appwrite.io/v1/storage/buckets/${APPWRITE_CONFIG.bucketId}/files/${response.$id}/view?project=${APPWRITE_CONFIG.projectId}`;
+}
+
+// Mere AI assistant backend. This is now a Netlify Function that
+// lives in this same project (see netlify/functions/ai.js), not the
+// old Google Apps Script deployment -- a relative path means it's
+// always same-origin with the site, so it works on any Netlify URL
+// (production, deploy previews, branch deploys) with no config
+// needed here. The client POSTs { prompt }, the function calls Groq
+// server-side (so the Groq key never has to live in this file) and
+// responds with JSON { reply: "..." }. See askMereAi() further down
+// for the exact request/response contract.
+const AI_URL = '/.netlify/functions/ai';
+
+// ----------------------------------------------------------------
+// PUSH NOTIFICATIONS (Firebase Cloud Messaging) -- VAPID key
+// ----------------------------------------------------------------
+// Get this from: Firebase Console -> Project Settings (gear icon) ->
+// Cloud Messaging tab -> "Web configuration" -> Web Push certificates
+// -> Generate key pair. Paste the long key string it gives you here.
+// Until this is a real key, push notifications (message alerts while
+// the app is closed/backgrounded) are simply skipped -- every other
+// feature in Mere works fine without it.
+const VAPID_KEY = 'BD03RvBu4VacUvV3vezC5hKFiG5Frg9bsqdC5gTSH2mcuYhyU5OmPhZ2yTAg5oqwR7SJZKPeBap8-w2_UWHlxGU';
+
+let firebaseApp = null, auth = null, db = null, rtdb = null, storage = null, messaging = null;
+const FIREBASE_CONFIGURED = firebaseConfig.apiKey !== 'YOUR_FIREBASE_API_KEY'
+  && firebaseConfig.projectId !== 'YOUR_PROJECT_ID';
+// Realtime DB needs its own readiness check -- databaseURL is missing
+// from the config above, so we must not call firebase.database()
+// until a real URL is in place (it throws otherwise).
+const RTDB_CONFIGURED = !!firebaseConfig.databaseURL
+  && !firebaseConfig.databaseURL.includes('YOUR_REALTIME_DATABASE_URL');
+if (FIREBASE_CONFIGURED && window.firebase) {
+  try {
+    firebaseApp = firebase.initializeApp(firebaseConfig);
+    auth = firebase.auth();
+    db = firebase.firestore();
+    storage = firebase.storage();
+    if (RTDB_CONFIGURED) {
+      rtdb = firebase.database();
+    } else {
+      console.warn('Mere: firebaseConfig.databaseURL is still a placeholder -- presence (online/offline dots) is disabled until it is set. Auth, messaging, ticks, typing and AI chat are unaffected.');
+    }
+    // Messaging (push) only works on http/https (not file://) and
+    // needs the browser to support Service Workers -- guard for both
+    // so this never throws on an unsupported browser.
+    if (firebase.messaging && firebase.messaging.isSupported && firebase.messaging.isSupported()) {
+      messaging = firebase.messaging();
+    }
+  } catch (e) {
+    console.warn('Firebase failed to initialize, falling back to local demo mode.', e);
+    auth = null; db = null; rtdb = null; storage = null; messaging = null;
+  }
+}
+const LOCAL_MODE = !auth || !db;
+
+/* ================================================================
+   APP STATE
+   ================================================================ */
+const APP = {
+  user: null,          // { id, username, email }
+  activeContact: null, // currently open contact id
+  pendingOtp: null,    // { code, mode: 'signup', draftUser }
+  darkMode: false,
+  theme: 'indigo',
+};
+
+// "Mere AI" -- always-available Gemini assistant contact (see the
+// sparkle icon in the chat header), pinned first the way most
+// messaging apps pin their AI contact above regular conversations.
+const AI_CONTACT = { id: 'mereai', name: 'Mere AI', initials: 'AI', status: 'online', isBot: true };
+
+// In real mode, human contacts are populated live from the `users`
+// Firestore collection (see subscribeRealContacts()) and their status
+// dots are driven by real Realtime DB presence (see
+// subscribeContactPresence()) -- nothing here is hardcoded once a real
+// backend is connected. In local demo mode there's no real user
+// directory to query, so we fall back to two fixed demo contacts.
+let CONTACTS = LOCAL_MODE
+  ? [AI_CONTACT, { id: 'kuroh', name: 'Kuroh', initials: 'K', status: 'online' }, { id: 'destiny', name: 'Destiny', initials: 'D', status: 'online' }]
+  : [AI_CONTACT];
+
+// Dummy seed messages per contact so the chat UI has something to show.
+const SEED_MESSAGES = {
+  mereai: [
+    { from: 'them', text: "Hi, I'm Mere AI. Ask me anything -- real Gemini-powered replies are coming in Phase 2.", ticks: null, time: 'Just now' },
+  ],
+  kuroh: [
+    { from: 'them', text: 'Hey, the sidebar collapse looks great.', ticks: null, time: '9:41 AM' },
+    { from: 'me', text: 'Thanks -- tweaking the glass blur a bit more.', ticks: 'read', time: '9:42 AM' },
+    { from: 'them', text: 'Take your time, no rush.', ticks: null, time: '9:43 AM' },
+  ],
+  destiny: [
+    { from: 'them', text: 'Pushed the developer page contacts.', ticks: null, time: 'Yesterday' },
+    { from: 'me', text: 'Got it, WhatsApp buttons work on my end.', ticks: 'read', time: 'Yesterday' },
+  ],
+};
+
+// Per-session message log, seeded from SEED_MESSAGES the first time a
+// contact's chat is opened. Kept in memory only for Phase 1.
+const MESSAGE_LOG = {};
+
+/* ================================================================
+   REAL-MODE CONTACTS & PRESENCE (Firestore + Realtime Database)
+   ------------------------------------------------------------
+   Only meaningful once a real backend is connected -- in local demo
+   mode / demo-login accounts every function here is a no-op via the
+   isRealChat()/LOCAL_MODE guards, and the app behaves exactly as it
+   did before (fake local contacts, fake tick timers).
+   ================================================================ */
+
+// Deterministic per-pair id: same value regardless of who's "me" and
+// who's "them", so both sides of a conversation read/write the exact
+// same Firestore documents (messages.chatId, typing/{chatId}).
+function chatIdFor(uidA, uidB) { return [uidA, uidB].sort().join('_'); }
+
+// True only when contactId is a real other signed-in user we should
+// talk to over Firestore/RTDB -- i.e. not the local AI pseudo-contact,
+// not local demo mode, and not a demo-login session (which has no real
+// backend counterpart to message).
+function isRealChat(contactId) {
+  return !LOCAL_MODE && contactId !== 'mereai' && !!APP.user && !APP.user.id.startsWith('demo_');
+}
+
+// Mere is built for two people, so Together (Watch Together +
+// High-Five) doesn't need a "pick who to sync with" screen -- it just
+// uses whichever chat you have open, and falls back to the first real
+// human contact (i.e. your other half) if none is open yet. If this
+// account ever grows past two people, this is the one place to swap
+// in a real "choose a partner" picker.
+function getPartnerId() {
+  if (APP.activeContact && isRealChat(APP.activeContact)) return APP.activeContact;
+  const human = CONTACTS.find(c => !c.isBot && c.id !== APP.user?.id);
+  return human ? human.id : null;
+}
+
+let contactsUnsub = null;
+const PRESENCE_LISTENERS = {}; // uid -> { ref, cb }, so listeners can be cleanly .off()'d
+
+// Populates CONTACTS from the `users` Firestore collection (every
+// verified user except yourself), live -- new sign-ups or profile
+// changes show up without a refresh. Called once after sign-in for
+// real (non-demo) sessions; see enterApp().
+function subscribeRealContacts() {
+  if (LOCAL_MODE) return;
+  contactsUnsub = db.collection('users').where('emailVerified', '==', true)
+    .onSnapshot(snap => {
+      const others = [];
+      snap.forEach(doc => {
+        if (doc.id === APP.user.id) return;
+        const d = doc.data();
+        const name = d.username || d.email || 'Unknown';
+        others.push({ id: doc.id, name, initials: initials(name), status: 'offline', isBot: false });
+      });
+      CONTACTS = [AI_CONTACT, ...others];
+      others.forEach(c => subscribeContactPresence(c.id));
+      renderContacts();
+      if (APP.activeContact && APP.activeContact !== 'mereai') {
+        const active = CONTACTS.find(c => c.id === APP.activeContact);
+        if (active) document.getElementById('chatHeaderName').textContent = active.name;
+      }
+      if (!hfUnsub) subscribeHighFives(); // now that a partner contact may exist, try again
+      if (!wtSyncUnsub && !LOCAL_MODE && !APP.user.id.startsWith('demo_')) {
+        const partnerId = getPartnerId();
+        if (partnerId) { wtRoom = chatIdFor(APP.user.id, partnerId); subscribeSyncState(); }
+      }
+    }, err => console.warn('Mere: contacts listener failed', err));
+}
+
+// Mirrors one contact's /status/{uid} RTDB node into their CONTACTS
+// entry and re-renders wherever that status is shown (contact list row,
+// open chat header). Registered once per uid and left running for the
+// rest of the session -- cheap for a handful of contacts, cleaned up
+// wholesale on logout via teardownContactsSubscription().
+function subscribeContactPresence(uid) {
+  if (!rtdb || PRESENCE_LISTENERS[uid]) return;
+  const ref = rtdb.ref('/status/' + uid);
+  const cb = snap => {
+    const val = snap.val();
+    const online = !!val && val.state === 'online';
+    const c = CONTACTS.find(x => x.id === uid);
+    if (c) c.status = online ? 'online' : 'offline';
+    renderContacts();
+    if (APP.activeContact === uid) setChatHeaderStatus(online ? 'Online' : 'Offline', false);
+  };
+  ref.on('value', cb);
+  PRESENCE_LISTENERS[uid] = { ref, cb };
+}
+
+function teardownContactsSubscription() {
+  if (contactsUnsub) contactsUnsub();
+  contactsUnsub = null;
+  Object.values(PRESENCE_LISTENERS).forEach(({ ref, cb }) => ref.off('value', cb));
+  for (const k in PRESENCE_LISTENERS) delete PRESENCE_LISTENERS[k];
+}
+
+/* ================================================================
+   SMALL UTILITIES
+   ================================================================ */
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str == null ? '' : String(str);
+  return d.innerHTML;
+}
+
+function toast(message, type = 'info') {
+  const icons = { success: 'fa-circle-check', error: 'fa-circle-exclamation', warn: 'fa-triangle-exclamation', info: 'fa-circle-info' };
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<i class="fa-solid ${icons[type] || icons.info}"></i><span>${escapeHtml(message)}</span>`;
+  document.getElementById('toastWrap').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; setTimeout(() => el.remove(), 250); }, 3400);
+}
+
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+function togglePwVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  const icon = btn.querySelector('i');
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  icon.className = show ? 'fa-solid fa-eye-slash' : 'fa-solid fa-eye';
+}
+
+function initials(name) {
+  return (name || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0].toUpperCase()).join('');
+}
+
+/* ================================================================
+   AUTHENTICATION
+   ================================================================
+   Local demo mode: a small "users" table lives in localStorage so
+   sign up / sign in / OTP all work without a Firebase project.
+   Once firebaseConfig above is filled in with real values, the
+   Firebase Auth + Firestore branches below take over automatically.
+
+   Note on OTP: Firebase Auth has no built-in 6-digit email code
+   (Supabase does). The code is generated client-side and written to
+   the `emailOtps` Firestore collection; in both modes it is also
+   surfaced via toast so the flow is fully testable without a mail
+   server. To have Mere actually email the code in production, deploy
+   the Firebase "Trigger Email from Firestore" extension (or a Cloud
+   Function) that watches `emailOtps` and sends it -- see the schema
+   comment block above.
+   ================================================================ */
+function loadLocalUsers() {
+  try { return JSON.parse(localStorage.getItem('mere_local_users') || '{}'); }
+  catch (e) { return {}; }
+}
+function saveLocalUsers(users) { localStorage.setItem('mere_local_users', JSON.stringify(users)); }
+
+function openSignupModal() { openModal('signupModal'); }
+
+function generateOtp() { return String(Math.floor(100000 + Math.random() * 900000)); }
+
+// Sends the OTP code to the user's inbox via the same Google Apps
+// Script deployment the Mere AI chat already uses (GAS_URL). The
+// script must already export a sendOtpEmail() helper and dispatch to
+// it on the server side -- roughly:
+//   function doPost(e) {
+//     const body = JSON.parse(e.postData.contents);
+//     if (body.action === 'sendOtp') {
+//       sendOtpEmail(body.email, body.code, body.username);
+//       return ContentService.createTextOutput(JSON.stringify({ ok: true }))
+//         .setMimeType(ContentService.MimeType.JSON);
+//     }
+//     // ...existing action === 'ai' branch stays as-is...
+//   }
+// Like askMereAi(), this stays a "simple request" (text/plain body,
+// no custom headers) since Apps Script Web Apps don't support CORS
+// preflight (OPTIONS) requests.
+async function sendOtpEmailViaGas(email, code, username) {
+  const res = await fetch(GAS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: 'sendOtp', email, code, username }),
+  });
+  if (!res.ok) throw new Error('GAS responded with HTTP ' + res.status);
+}
+
+async function doSignUp() {
+  const username = document.getElementById('suUsername').value.trim();
+  const email = document.getElementById('suEmail').value.trim().toLowerCase();
+  const pass = document.getElementById('suPass').value;
+  const confirm = document.getElementById('suConfirm').value;
+
+  if (!username || !email || !pass) return toast('Please fill in every field.', 'error');
+  if (pass.length < 6) return toast('Password must be at least 6 characters.', 'error');
+  if (pass !== confirm) return toast('Passwords do not match.', 'error');
+
+  if (!LOCAL_MODE) {
+    // ---- Real Firebase path: create the Auth user, then gate app
+    // entry behind a Firestore-backed OTP code (see comment above). --
+    try {
+      const cred = await auth.createUserWithEmailAndPassword(email, pass);
+      const uid = cred.user.uid;
+
+      // OTP verification removed -- accounts are usable immediately
+      // after signup. emailVerified stays in the schema (and stays
+      // true) only because subscribeRealContacts()'s contacts query
+      // still filters on it; it no longer gates anything here.
+      await db.collection('users').doc(uid).set({
+        username, email, avatarUrl: null, onlineStatus: 'offline',
+        emailVerified: true, lastSeen: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+
+      closeModal('signupModal');
+      toast('Account created. Welcome to Mere!', 'success');
+      // createUserWithEmailAndPassword already signed this user into
+      // Firebase Auth, so we can enter the app directly.
+      signInSession({ id: uid, username, email });
+    } catch (e) {
+      toast(e.message || 'Could not create your account.', 'error');
+    }
+    return;
+  }
+
+  // ---- Local demo path ------------------------------------------
+  const users = loadLocalUsers();
+  if (users[email]) return toast('An account with that email already exists.', 'error');
+
+  const newUser = { id: 'u_' + Date.now(), username, email, pass };
+  users[email] = newUser;
+  saveLocalUsers(users);
+  closeModal('signupModal');
+  toast('Account created. Welcome to Mere!', 'success');
+  signInSession(newUser);
+}
+
+async function resendOtp() {
+  if (!APP.pendingOtp) return;
+  const code = generateOtp();
+  APP.pendingOtp.code = code;
+
+  if (!LOCAL_MODE) {
+    try {
+      await db.collection('emailOtps').doc(APP.pendingOtp.email).update({
+        code, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      });
+    } catch (e) { /* non-fatal in demo -- code still works client-side */ }
+  }
+  try {
+    await sendOtpEmailViaGas(APP.pendingOtp.email, code, APP.pendingOtp.username);
+    toast(`Verification code sent to ${APP.pendingOtp.email}.`, 'success');
+  } catch (mailErr) {
+    toast(`Could not email your code -- here it is: ${code}`, 'warn');
+  }
+}
+
+function focusFirstOtpDigit() {
+  const digits = document.querySelectorAll('.otp-digit');
+  digits.forEach(d => d.value = '');
+  setTimeout(() => digits[0] && digits[0].focus(), 150);
+}
+
+async function verifyOtp() {
+  const digits = document.querySelectorAll('.otp-digit');
+  const entered = Array.from(digits).map(d => d.value).join('');
+  if (entered.length !== 6) return toast('Enter all 6 digits.', 'error');
+  if (!APP.pendingOtp) return toast('Nothing to verify.', 'error');
+  if (entered !== APP.pendingOtp.code) return toast('Incorrect code, try again.', 'error');
+
+  if (!LOCAL_MODE) {
+    const { email, username, uid } = APP.pendingOtp;
+    try {
+      await db.collection('users').doc(uid).update({ emailVerified: true });
+      await db.collection('emailOtps').doc(email).delete();
+      APP.pendingOtp = null;
+      closeModal('otpModal');
+      toast('Account verified. Signing you in...', 'success');
+      // createUserWithEmailAndPassword already signed this user into
+      // Firebase Auth, so we can enter the app directly.
+      signInSession({ id: uid, username, email });
+    } catch (e) {
+      toast(e.message || 'Verification failed.', 'error');
+    }
+    return;
+  }
+
+  const { email, username, pass } = APP.pendingOtp;
+  const users = loadLocalUsers();
+  users[email] = { id: 'u_' + Date.now(), username, email, pass };
+  saveLocalUsers(users);
+  APP.pendingOtp = null;
+  closeModal('otpModal');
+  toast('Account verified. Signing you in...', 'success');
+  signInSession(users[email]);
+}
+
+async function doSignIn() {
+  const emailOrUser = document.getElementById('loginEmail').value.trim();
+  const pass = document.getElementById('loginPass').value;
+  const remember = document.getElementById('rememberSwitch').classList.contains('on');
+  if (!emailOrUser || !pass) return toast('Enter your email and password.', 'error');
+
+  if (!LOCAL_MODE) {
+    try {
+      // "Remember me" maps to Firebase Auth's native persistence modes:
+      // LOCAL survives browser restarts, SESSION clears on tab close.
+      await auth.setPersistence(remember
+        ? firebase.auth.Auth.Persistence.LOCAL
+        : firebase.auth.Auth.Persistence.SESSION);
+
+      const cred = await auth.signInWithEmailAndPassword(emailOrUser, pass);
+      const uid = cred.user.uid;
+      const profileSnap = await db.collection('users').doc(uid).get();
+      const profile = profileSnap.exists ? profileSnap.data() : null;
+      signInSession({
+        id: uid,
+        username: profile?.username || cred.user.displayName || emailOrUser,
+        email: cred.user.email,
+      });
+    } catch (e) {
+      toast(e.message || 'Incorrect email/username or password.', 'error');
+    }
+    return;
+  }
+
+  const users = loadLocalUsers();
+  const key = emailOrUser.toLowerCase();
+  const match = users[key] || Object.values(users).find(u => u.username.toLowerCase() === key);
+  if (!match || match.pass !== pass) return toast('Incorrect email/username or password.', 'error');
+  signInSession(match, remember);
+}
+
+function demoLogin(role) {
+  const demoUser = role === 'teacher'
+    ? { id: 'demo_teacher', username: 'Demo Teacher', email: 'demo.teacher@mere.app' }
+    : { id: 'demo_student', username: 'Demo Student', email: 'demo.student@mere.app' };
+  signInSession(demoUser, true);
+}
+
+function signInSession(user, remember = true) {
+  APP.user = { id: user.id, username: user.username, email: user.email };
+  // In real Firebase mode, Auth persistence (set in doSignIn) already
+  // handles session survival -- localStorage is only needed as the
+  // session store for local demo mode and demo-login accounts.
+  if (LOCAL_MODE || user.id.startsWith('demo_')) {
+    if (remember) localStorage.setItem('mere_session', JSON.stringify(APP.user));
+    else sessionStorage.setItem('mere_session', JSON.stringify(APP.user));
+  }
+  enterApp();
+}
+
+// Used for LOCAL_MODE and demo-login sessions only. Real Firebase
+// sessions are restored via the onAuthStateChanged listener set up
+// in the DOMContentLoaded handler below.
+function restoreSession() {
+  const raw = localStorage.getItem('mere_session') || sessionStorage.getItem('mere_session');
+  if (!raw) return false;
+  try { APP.user = JSON.parse(raw); return true; }
+  catch (e) { return false; }
+}
+
+function doLogout() {
+  if (activeMessagesUnsub) { activeMessagesUnsub(); activeMessagesUnsub = null; }
+  if (activeTypingUnsub) { activeTypingUnsub(); activeTypingUnsub = null; }
+  teardownContactsSubscription();
+  teardownStatuses();
+  teardownTogether();
+  teardownHighFives();
+  pushSetupDone = false;
+  APP.user = null;
+  localStorage.removeItem('mere_session');
+  sessionStorage.removeItem('mere_session');
+  teardownPresence();
+  if (!LOCAL_MODE) auth.signOut();
+  closeModal('logoutModal');
+  document.getElementById('appShell').classList.remove('active');
+  document.getElementById('loginScreen').style.display = 'flex';
+  toast('Logged out.', 'info');
+}
+
+/* ================================================================
+   APP ENTRY / TOPBAR / NAVIGATION
+   ================================================================ */
+function enterApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appShell').classList.add('active');
+
+  const av = initials(APP.user.username);
+  document.getElementById('topbarAvatar').innerHTML = `${av}<span class="status-dot online"></span>`;
+  document.getElementById('topbarName').textContent = APP.user.username;
+  document.getElementById('settingsAvatar').textContent = av;
+  document.getElementById('settingsName').textContent = APP.user.username;
+  document.getElementById('settingsEmail').textContent = APP.user.email;
+  document.getElementById('accUsername').textContent = APP.user.username;
+  document.getElementById('accEmail').textContent = APP.user.email;
+
+  renderContacts();
+  requestNotificationPermission();
+  if (!LOCAL_MODE && !APP.user.id.startsWith('demo_')) {
+    setupPresence(APP.user.id);
+    subscribeRealContacts();
+  }
+  renderStatuses(); // shows local/cached posts immediately; subscribeStatuses() below refines it in real mode
+  subscribeStatuses();
+  subscribeHighFives();
+  if (canUseBackend()) {
+    const partnerId = getPartnerId();
+    if (partnerId) { wtRoom = chatIdFor(APP.user.id, partnerId); subscribeSyncState(); }
+  }
+}
+
+function navTo(tab, el) {
+  // Switching tabs (Chats/Status/Together/Developer/Settings) while a
+  // chat is open should close the chat overlay first. If we pushed a
+  // history entry for that chat, unwind it so the browser back button
+  // doesn't later land on a "ghost" chat state for a tab the user has
+  // already left.
+  if (document.getElementById('chatScreen').classList.contains('open')) {
+    document.getElementById('chatScreen').classList.remove('open');
+    if (history.state && history.state.view === 'chat') history.back();
+  }
+
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + tab).classList.add('active');
+
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === tab));
+  document.querySelectorAll('.bn-item').forEach(n => n.classList.toggle('active', n.dataset.tab === tab));
+
+  closeSidebar();
+}
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebarOverlay').classList.toggle('open');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarOverlay').classList.remove('open');
+}
+
+/* ================================================================
+   CHAT SKELETON
+   ================================================================ */
+function renderContacts() {
+  const q = (document.getElementById('contactSearch')?.value || '').toLowerCase();
+  const list = document.getElementById('contactList');
+  const filtered = CONTACTS.filter(c => c.name.toLowerCase().includes(q));
+
+  // EMPTY STATE: no chats at all vs. a search with zero matches.
+  if (filtered.length === 0) {
+    list.innerHTML = q
+      ? `<div class="list-empty-state"><i class="fa-solid fa-magnifying-glass"></i><div><strong>No chats found</strong><br><span>Try a different name.</span></div></div>`
+      : `<div class="list-empty-state"><i class="fa-solid fa-comments"></i><div><strong>No chats yet</strong><br><span>Start a conversation to see it here.</span></div></div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(c => {
+    const log = MESSAGE_LOG[c.id] || SEED_MESSAGES[c.id] || [];
+    const last = log[log.length - 1];
+    const preview = last ? (last.from === 'me' ? 'You: ' + last.text : last.text) : 'Tap to chat';
+    const time = last ? last.time : '';
+    const aiBadge = c.isBot ? `<span class="ai-badge">AI</span>` : '';
+    const muteIcon = MUTED_CONTACTS.has(c.id) ? `<i class="fa-solid fa-bell-slash contact-mute-icon" title="Muted"></i>` : '';
+    return `
+      <div class="contact-item ${APP.activeContact === c.id ? 'active' : ''}" onclick="openChat('${c.id}')">
+        <div class="avatar">${c.initials}<span class="status-dot ${c.status}"></span></div>
+        <div class="contact-meta">
+          <div class="contact-name">${escapeHtml(c.name)}${aiBadge}</div>
+          <div class="contact-preview">${escapeHtml(preview)}</div>
+        </div>
+        <div class="contact-time">${muteIcon}${escapeHtml(time)}</div>
+      </div>`;
+  }).join('');
+}
+
+let activeMessagesUnsub = null;
+let activeTypingUnsub = null;
+let typingDebounceTimer = null;
+
+function openChat(contactId) {
+  const previousContact = APP.activeContact;
+
+  // Leaving a real chat: stop broadcasting "typing" there and drop
+  // its two listeners before attaching new ones for the next chat.
+  if (previousContact && isRealChat(previousContact)) {
+    db.collection('typing').doc(chatIdFor(APP.user.id, previousContact))
+      .set({ [APP.user.id]: false }, { merge: true }).catch(() => {});
+  }
+  if (activeMessagesUnsub) { activeMessagesUnsub(); activeMessagesUnsub = null; }
+  if (activeTypingUnsub) { activeTypingUnsub(); activeTypingUnsub = null; }
+  clearTimeout(typingDebounceTimer);
+
+  APP.activeContact = contactId;
+  const contact = CONTACTS.find(c => c.id === contactId);
+  if (!contact) return; // real mode: contact list hasn't loaded yet -- ignore the stray click
+
+  document.getElementById('chatScreen').classList.add('open');
+
+  // BACK BUTTON BEHAVIOUR: push a history entry marking "a chat is
+  // open". The back arrow (in the chat header) calls history.back()
+  // rather than closing the chat directly, so pressing that arrow OR
+  // the browser/hardware back button both trigger the SAME
+  // window.onpopstate handler below -- one code path, no duplicated
+  // logic, and the app is never exited from inside a chat.
+  history.pushState({ view: 'chat', contactId }, '', '#chat/' + contactId);
+
+  document.getElementById('chatHeaderAvatar').innerHTML = contact.initials;
+  document.getElementById('chatHeaderName').textContent = contact.name;
+  document.getElementById('chatHeaderAiBadge').classList.toggle('hidden', !contact.isBot);
+  document.getElementById('askAiBtn').classList.toggle('hidden', contactId === 'mereai');
+  document.getElementById('hfHeaderBtn').classList.toggle('hidden', contactId === 'mereai');
+  setChatHeaderStatus(contact.status === 'online' ? 'Online' : 'Offline', false);
+  document.getElementById('chatMenu').classList.remove('open');
+  updateMuteMenuUI(contactId);
+  renderContacts();
+
+  if (isRealChat(contactId)) {
+    MESSAGE_LOG[contactId] = MESSAGE_LOG[contactId] || [];
+    renderMessages(); // show whatever's cached instantly; the snapshot below refines it
+    subscribeToMessages(contactId);
+    subscribeToTyping(contactId);
+    subscribeHighFives(contactId); // keeps the header badge + Together count in sync with this contact
+  } else {
+    if (!MESSAGE_LOG[contactId]) MESSAGE_LOG[contactId] = [...(SEED_MESSAGES[contactId] || [])];
+    renderMessages();
+  }
+}
+
+// Real-time message thread for a real contact. Firestore's local
+// cache means a message you just sent typically reappears via this
+// same listener within milliseconds (marked 'sent'), so sendMessage()
+// deliberately does NOT push an optimistic copy -- this is the single
+// source of truth for what's on screen.
+//
+// NOTE: this query (where chatId ==, orderBy createdAt) needs a
+// Firestore composite index. The very first time it runs, the
+// browser console will print a link that creates it automatically --
+// click it once and the query works from then on.
+function subscribeToMessages(contactId) {
+  const chatId = chatIdFor(APP.user.id, contactId);
+  activeMessagesUnsub = db.collection('messages')
+    .where('chatId', '==', chatId)
+    .orderBy('createdAt', 'asc')
+    .onSnapshot(snap => {
+      const myId = APP.user.id;
+      const docs = [];
+      const toDeliver = [];
+      const toRead = [];
+      snap.forEach(doc => {
+        const d = doc.data();
+        const mine = d.senderId === myId;
+        let ticks = 'sent';
+        if (d.readAt) ticks = 'read'; else if (d.deliveredAt) ticks = 'delivered';
+        docs.push({
+          from: mine ? 'me' : 'them',
+          text: d.content,
+          ticks: mine ? ticks : null,
+          time: d.createdAt ? d.createdAt.toDate().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '',
+        });
+        if (!mine) {
+          if (!d.deliveredAt) toDeliver.push(doc.id);
+          if (APP.activeContact === contactId && !d.readAt) toRead.push(doc.id);
+        }
+      });
+      MESSAGE_LOG[contactId] = docs;
+      if (APP.activeContact === contactId) renderMessages();
+      renderContacts();
+      // Fire-and-forget status bumps -- these trigger another
+      // snapshot on the sender's side, which is what actually
+      // animates their tick from single -> double -> blue-double.
+      toDeliver.forEach(id => db.collection('messages').doc(id)
+        .update({ deliveredAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(() => {}));
+      toRead.forEach(id => db.collection('messages').doc(id)
+        .update({ readAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(() => {}));
+    }, err => { console.warn('Mere: messages listener failed', err); toast('Could not load messages.', 'error'); });
+}
+
+// Mirrors the typing/{chatId} doc's flag for the OTHER participant
+// into the chat header + typing row. See setTypingState()/
+// handleChatInputTyping() for the write side.
+function subscribeToTyping(contactId) {
+  const chatId = chatIdFor(APP.user.id, contactId);
+  activeTypingUnsub = db.collection('typing').doc(chatId).onSnapshot(doc => {
+    if (APP.activeContact !== contactId) return;
+    const theyTyping = !!(doc.data() || {})[contactId];
+    if (theyTyping) {
+      setChatHeaderStatus('typing...', true);
+      showTypingRow();
+    } else {
+      hideTypingRow();
+      const c = CONTACTS.find(x => x.id === contactId);
+      setChatHeaderStatus(c && c.status === 'online' ? 'Online' : 'Offline', false);
+    }
+  }, () => {});
+}
+
+// Writes this user's own typing flag for the currently-open real
+// chat. Debounced to false 2.5s after the last keystroke so a flag
+// never gets stuck "true" if someone just walks away mid-sentence.
+function handleChatInputTyping() {
+  if (!isRealChat(APP.activeContact)) return;
+  setTypingState(true);
+  clearTimeout(typingDebounceTimer);
+  typingDebounceTimer = setTimeout(() => setTypingState(false), 2500);
+}
+function setTypingState(isTyping) {
+  const contactId = APP.activeContact;
+  if (!isRealChat(contactId)) return;
+  db.collection('typing').doc(chatIdFor(APP.user.id, contactId))
+    .set({ [APP.user.id]: isTyping }, { merge: true }).catch(() => {});
+}
+
+// Restores the Chats List. Called by window.onpopstate -- never call
+// this directly to "go back"; use history.back() (see the back-arrow
+// button and navTo()) so the history stack and the visible screen
+// never drift out of sync.
+function closeActiveChat() {
+  const chatScreen = document.getElementById('chatScreen');
+  chatScreen.classList.remove('open');
+  document.getElementById('chatMenu').classList.remove('open');
+  // Clear any inline sizing the keyboard-handling code (see
+  // setupKeyboardHandling()) applied while this chat was open, so the
+  // next chat opened doesn't briefly inherit a stale height/offset.
+  chatScreen.style.height = '';
+  chatScreen.style.top = '';
+}
+
+// One handler for BOTH the in-app back arrow and the browser's/
+// device's native back button/gesture. Since openChat() is the only
+// place that ever calls history.pushState(), any popstate here means
+// "leave the chat" -- so we just close it. This also means the app
+// itself is never exited by pressing back while inside a chat: the
+// browser only ever navigates within our own pushed history entries.
+window.onpopstate = function () {
+  closeActiveChat();
+};
+
+function toggleChatMenu() {
+  document.getElementById('chatMenu').classList.toggle('open');
+}
+
+// Close the 3-dot menu on any click outside it (including the
+// backdrop behind #chatScreen), matching standard dropdown behaviour.
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('chatMenu');
+  if (!menu || !menu.classList.contains('open')) return;
+  if (!e.target.closest('.chat-menu-wrap')) menu.classList.remove('open');
+});
+
+// Updates both the header status line and, during a typing preview,
+// swaps it for an accent-coloured "typing..." label -- the same spot
+// WhatsApp itself shows typing status in.
+function setChatHeaderStatus(text, isTyping) {
+  const statusEl = document.getElementById('chatHeaderStatus');
+  const textEl = document.getElementById('chatHeaderStatusText');
+  statusEl.classList.toggle('typing', !!isTyping);
+  statusEl.querySelector('.status-dot')?.classList.toggle('hidden', !!isTyping);
+  textEl.textContent = text;
+}
+
+// Builds the HTML for one message row. `animate` adds the slide-in
+// class (see .msg-anim in the Phase-2 CSS block) -- only ever passed
+// true for a message being appended live (see appendMessageDOM), never
+// for the initial full-history render, so opening a chat doesn't
+// replay every bubble's entrance animation at once.
+function renderMessageRowHTML(m, index, animate) {
+  const tick = m.from === 'me'
+    ? `<span class="msg-ticks" data-state="${m.ticks || 'sent'}">
+         <i class="fa-solid fa-check tick-single"></i>
+         <i class="fa-solid fa-check-double tick-double"></i>
+       </span>`
+    : '';
+  return `
+    <div class="msg-row ${m.from === 'me' ? 'out' : 'in'} ${animate ? 'msg-anim' : ''}" data-msg-index="${index}">
+      <div class="msg-bubble">
+        ${escapeHtml(m.text)}
+        <div class="msg-meta"><span>${escapeHtml(m.time)}</span>${tick}</div>
+      </div>
+    </div>`;
+}
+
+function renderMessages() {
+  const box = document.getElementById('chatMessages');
+  const log = MESSAGE_LOG[APP.activeContact] || [];
+  box.innerHTML = log.map((m, i) => renderMessageRowHTML(m, i, false)).join('');
+  scrollChatToBottom();
+}
+
+// Appends a single message bubble without touching the rest of the
+// thread's DOM -- keeps scroll position stable and means only the
+// new bubble plays the slide-in animation, not the whole history.
+function appendMessageDOM(m, index, animate) {
+  document.getElementById('chatMessages').insertAdjacentHTML('beforeend', renderMessageRowHTML(m, index, animate));
+}
+
+function scrollChatToBottom() {
+  const box = document.getElementById('chatMessages');
+  box.scrollTop = box.scrollHeight;
+}
+
+// Mutates just the tick icon's data-state in place (no re-render), so
+// the CSS crossfade between single-check and double-check (see
+// .msg-ticks in the Phase-2 CSS block) actually has an old and a new
+// state to transition between.
+function updateMessageTickState(contactId, index, newState) {
+  const log = MESSAGE_LOG[contactId];
+  if (!log || !log[index]) return;
+  log[index].ticks = newState;
+  if (APP.activeContact !== contactId) return; // that chat isn't on screen right now
+  const row = document.querySelector(`#chatMessages .msg-row[data-msg-index="${index}"]`);
+  const ticksEl = row?.querySelector('.msg-ticks');
+  if (ticksEl) ticksEl.dataset.state = newState;
+}
+
+function showTypingRow() {
+  const box = document.getElementById('chatMessages');
+  if (document.getElementById('typingRow')) return;
+  const row = document.createElement('div');
+  row.className = 'typing-row';
+  row.id = 'typingRow';
+  row.innerHTML = '<span class="typing-label">typing</span><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
+  box.appendChild(row);
+  scrollChatToBottom();
+}
+function hideTypingRow() { document.getElementById('typingRow')?.remove(); }
+
+function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || !APP.activeContact) return;
+  const contactId = APP.activeContact;
+  input.value = '';
+  clearTimeout(typingDebounceTimer);
+  setTypingState(false);
+
+  if (contactId === 'mereai') { sendMereAiMessage(text); return; }
+
+  if (isRealChat(contactId)) {
+    db.collection('messages').add({
+      chatId: chatIdFor(APP.user.id, contactId),
+      senderId: APP.user.id, receiverId: contactId, content: text,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      deliveredAt: null, readAt: null,
+    }).catch(e => toast(e.message || 'Message failed to send.', 'error'));
+    // No optimistic local push here -- subscribeToMessages()'s
+    // onSnapshot listener is the single source of truth and renders
+    // this the moment Firestore echoes it back (near-instant thanks
+    // to its local write cache).
+    return;
+  }
+
+  // ---- Local demo / demo-login fallback: original fake progression. ----
+  const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const log = MESSAGE_LOG[contactId];
+  const msg = { from: 'me', text, ticks: 'sent', time };
+  log.push(msg);
+  const index = log.length - 1;
+  appendMessageDOM(msg, index, true);
+  scrollChatToBottom();
+  renderContacts();
+  setTimeout(() => updateMessageTickState(contactId, index, 'delivered'), 700);
+  setTimeout(() => updateMessageTickState(contactId, index, 'read'), 1600);
+}
+
+// Demo-only toggle so the typing-indicator UI can be reviewed before
+// Realtime presence is wired up in Phase 2.
+function simulateTypingDemo() {
+  if (!APP.activeContact) return;
+  const contactId = APP.activeContact;
+  const contact = CONTACTS.find(c => c.id === contactId);
+
+  setChatHeaderStatus('typing...', true);
+  showTypingRow();
+
+  setTimeout(() => {
+    hideTypingRow();
+    setChatHeaderStatus(contact.status === 'online' ? 'Online' : 'Offline', false);
+    // Follow up with a message so the demo feels complete.
+    const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const log = MESSAGE_LOG[contactId];
+    const msg = { from: 'them', text: `${contact.name} is just previewing the typing indicator.`, ticks: null, time };
+    log.push(msg);
+    if (APP.activeContact === contactId) { appendMessageDOM(msg, log.length - 1, true); scrollChatToBottom(); }
+    renderContacts();
+  }, 2200);
+}
+
+// Mere AI's thread is intentionally NOT stored in Firestore (there's
+// no `messages` schema entry for it, and it isn't a conversation
+// between two real users) -- it stays in the same in-memory
+// MESSAGE_LOG used by local demo mode, exactly like Phase 1, just
+// with a real Gemini reply instead of a canned string.
+function sendMereAiMessage(text) {
+  const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const log = MESSAGE_LOG['mereai'];
+  const msg = { from: 'me', text, ticks: 'read', time };
+  log.push(msg);
+  appendMessageDOM(msg, log.length - 1, true);
+  scrollChatToBottom();
+  renderContacts();
+  askMereAi(text);
+}
+
+// Offline/unreachable fallbacks -- used only if the GAS endpoint
+// can't be reached (network error, timeout, non-OK HTTP status) or
+// returns something Mere doesn't understand, so the assistant never
+// just goes silent. A small pool of varied, on-brand pre-written
+// replies is picked at random so two consecutive failures don't look
+// identical to the user.
+const AI_OFFLINE_FALLBACKS = [
+  "I'm having trouble reaching my brain right now, but I'm still here. Try asking again in a moment.",
+  "Hmm, that didn't quite get through on my end. Mind trying that again?",
+  "I'm briefly offline from my AI backend, but the rest of Mere is working fine. Give me another try shortly.",
+  "Connection hiccup on my side -- send that again and I'll do my best to catch it this time.",
+  "I couldn't process that just now. I'm still learning to stay online consistently, so please retry in a bit.",
+];
+
+// Small helper: wraps a fetch() in an AbortController-based timeout
+// so a hung request (e.g. a sleepy/unreachable Apps Script
+// deployment) can't leave the "typing..." indicator spinning forever.
+function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
+// Does exactly one attempt at calling the Netlify Function/Groq
+// backend and returns the reply text, or throws on any failure.
+// Kept separate from askMereAi() so the retry logic below can call
+// it twice without duplicating the request-building code.
+//
+// This is same-origin (AI_URL is a relative path), so unlike the
+// old Apps Script setup there's no CORS preflight to dodge -- a
+// normal JSON POST with a shorter timeout is fine, since a Netlify
+// Function has no cold-start penalty anywhere near what Apps Script
+// had.
+async function callMereAiBackend(prompt) {
+  const res = await fetchWithTimeout(AI_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  }, 8000); // 8s timeout per attempt
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || ('AI backend responded with HTTP ' + res.status));
+  const replyText = data.reply || data.text || data.message;
+  if (!replyText) throw new Error('AI backend response had no reply/text/message field');
+  return replyText;
+}
+
+// Small sleep helper used between the first attempt and the retry.
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function askMereAi(prompt) {
+  setChatHeaderStatus('typing...', true);
+  if (APP.activeContact === 'mereai') showTypingRow();
+
+  let replyText;
+  try {
+    // First attempt.
+    replyText = await callMereAiBackend(prompt);
+  } catch (firstError) {
+    console.warn('Mere AI request failed (attempt 1), retrying in 2s...', firstError);
+    try {
+      // Retry once after a short delay -- covers transient network
+      // blips and Apps Script cold starts, without retrying forever.
+      await wait(2000);
+      replyText = await callMereAiBackend(prompt);
+    } catch (secondError) {
+      console.warn('Mere AI request failed (attempt 2), falling back to a local reply.', secondError);
+      replyText = AI_OFFLINE_FALLBACKS[Math.floor(Math.random() * AI_OFFLINE_FALLBACKS.length)];
+    }
+  }
+
+  hideTypingRow();
+  const contact = CONTACTS.find(c => c.id === 'mereai');
+  setChatHeaderStatus(contact.status === 'online' ? 'Online' : 'Offline', false);
+  const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const log = MESSAGE_LOG['mereai'];
+  const msg = { from: 'them', text: replyText, ticks: null, time };
+  log.push(msg);
+  if (APP.activeContact === 'mereai') { appendMessageDOM(msg, log.length - 1, true); scrollChatToBottom(); }
+  renderContacts();
+}
+
+/* ================================================================
+   3-DOT CHAT MENU ACTIONS (Mute / Clear -- functional; Search / Block
+   are UI placeholders per spec, wired up in the markup above)
+   ================================================================ */
+const MUTED_CONTACTS = new Set();
+
+function updateMuteMenuUI(contactId) {
+  const icon = document.getElementById('muteMenuIcon');
+  const label = document.getElementById('muteMenuLabel');
+  if (!icon || !label) return;
+  const muted = MUTED_CONTACTS.has(contactId);
+  icon.className = muted ? 'fa-solid fa-bell' : 'fa-solid fa-bell-slash';
+  label.textContent = muted ? 'Unmute notifications' : 'Mute notifications';
+}
+
+function toggleMuteContact() {
+  if (!APP.activeContact) return;
+  const id = APP.activeContact;
+  if (MUTED_CONTACTS.has(id)) MUTED_CONTACTS.delete(id); else MUTED_CONTACTS.add(id);
+  updateMuteMenuUI(id);
+  toggleChatMenu();
+  renderContacts();
+  toast(MUTED_CONTACTS.has(id) ? 'Notifications muted for this chat.' : 'Notifications unmuted.', 'info');
+}
+
+async function clearActiveChat() {
+  if (!APP.activeContact) return;
+  const contactId = APP.activeContact;
+  toggleChatMenu();
+
+  if (isRealChat(contactId)) {
+    try {
+      const snap = await db.collection('messages').where('chatId', '==', chatIdFor(APP.user.id, contactId)).get();
+      const batch = db.batch();
+      snap.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      // subscribeToMessages()'s onSnapshot listener will confirm this
+      // with an empty render; clear the local cache now too so the
+      // UI doesn't wait on the round trip.
+    } catch (e) {
+      toast(e.message || 'Could not clear chat.', 'error');
+      return;
+    }
+  }
+  MESSAGE_LOG[contactId] = [];
+  renderMessages();
+  renderContacts();
+  toast('Chat cleared.', 'success');
+}
+
+// True only when we should read/write real Firestore + Storage data
+// (statuses, syncState, highFives) instead of the in-memory demo
+// fallback -- same rule used for real chat, just without the "not the
+// AI contact" clause since none of these features involve the AI.
+function canUseBackend() {
+  return !LOCAL_MODE && !!APP.user && !APP.user.id.startsWith('demo_');
+}
+
+/* ================================================================
+   STATUS POSTS
+   ------------------------------------------------------------
+   Firestore collection `statuses`: userId, username, content,
+   mediaUrl (nullable), createdAt, expiresAt (nullable -- null means
+   "forever"). Photos upload to Firebase Storage at
+   status-media/{userId}/{timestamp}_{filename} and mediaUrl is the
+   resulting download URL.
+   Local demo mode keeps everything in the LOCAL_STATUSES array below
+   instead, so the composer/timeline UI is still fully clickable
+   without a real backend.
+   ================================================================ */
+let statusesUnsub = null;
+let LOCAL_STATUSES = [];
+const STATUS_DRAFT = { expiry: '1h', imageFile: null, editingId: null };
+
+function expiryToDate(choice) {
+  const now = Date.now();
+  if (choice === '1h') return new Date(now + 60 * 60 * 1000);
+  if (choice === '1d') return new Date(now + 24 * 60 * 60 * 1000);
+  if (choice === '1w') return new Date(now + 7 * 24 * 60 * 60 * 1000);
+  return null; // 'forever'
+}
+function expiryLabel(expiresAt) {
+  if (!expiresAt) return 'Forever';
+  const ms = expiresAt - Date.now();
+  if (ms <= 0) return 'Expired';
+  const hrs = ms / 3600000;
+  if (hrs < 1) return Math.max(1, Math.round(ms / 60000)) + 'm left';
+  if (hrs < 24) return Math.round(hrs) + 'h left';
+  return Math.round(hrs / 24) + 'd left';
+}
+function timeAgo(date) {
+  if (!date) return '';
+  const s = Math.max(1, Math.floor((Date.now() - date) / 1000));
+  if (s < 60) return 'Just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+function openStatusComposer(editId) {
+  STATUS_DRAFT.editingId = editId || null;
+  STATUS_DRAFT.imageFile = null;
+  document.getElementById('statusImageInput').value = '';
+  removeStatusImage();
+
+  if (editId) {
+    const post = LOCAL_STATUSES_CACHE.find(s => s.id === editId);
+    if (!post) return;
+    document.getElementById('statusModalTitle').textContent = 'Edit Status';
+    document.getElementById('statusText').value = post.content || '';
+    document.getElementById('statusSubmitBtn').innerHTML = '<i class="fa-solid fa-check"></i> Save Changes';
+    if (post.mediaUrl) {
+      document.getElementById('statusMediaPreviewImg').src = post.mediaUrl;
+      document.getElementById('statusMediaPreview').classList.add('show');
+    }
+    // Editing only ever changes content/photo, never the expiry window
+    // (see submitStatus) -- the chips are just shown for reference,
+    // defaulting to whichever roughly matches the post's current state.
+    const refChoice = post.expiresAt ? '1h' : 'forever';
+    setStatusExpiry(refChoice, document.querySelector(`.expiry-chip[data-exp="${refChoice}"]`));
+  } else {
+    document.getElementById('statusModalTitle').textContent = 'New Status';
+    document.getElementById('statusText').value = '';
+    document.getElementById('statusSubmitBtn').innerHTML = '<i class="fa-solid fa-paper-plane"></i> Post Status';
+    setStatusExpiry('1h', document.querySelector('.expiry-chip[data-exp="1h"]'));
+  }
+  openModal('statusModal');
+}
+
+function setStatusExpiry(choice, el) {
+  STATUS_DRAFT.expiry = choice;
+  document.querySelectorAll('.expiry-chip').forEach(c => c.classList.remove('active'));
+  if (el) el.classList.add('active');
+}
+
+function handleStatusImagePick(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please choose an image file.', 'error'); return; }
+  STATUS_DRAFT.imageFile = file;
+  const reader = new FileReader();
+  reader.onload = () => {
+    document.getElementById('statusMediaPreviewImg').src = reader.result;
+    document.getElementById('statusMediaPreview').classList.add('show');
+  };
+  reader.readAsDataURL(file);
+}
+function removeStatusImage() {
+  STATUS_DRAFT.imageFile = null;
+  document.getElementById('statusMediaPreviewImg').src = '';
+  document.getElementById('statusMediaPreview').classList.remove('show');
+}
+
+async function submitStatus() {
+  const content = document.getElementById('statusText').value.trim();
+  if (!content && !STATUS_DRAFT.imageFile && !document.getElementById('statusMediaPreview').classList.contains('show')) {
+    return toast('Write something or add a photo first.', 'error');
+  }
+  const btn = document.getElementById('statusSubmitBtn');
+  btn.disabled = true;
+
+  try {
+    if (canUseBackend()) {
+      let mediaUrl = STATUS_DRAFT.editingId
+        ? (LOCAL_STATUSES_CACHE.find(s => s.id === STATUS_DRAFT.editingId)?.mediaUrl || null)
+        : null;
+
+      if (STATUS_DRAFT.imageFile) {
+        // Was: storage.ref(path).put(file) + getDownloadURL() on
+        // Firebase Storage. Now: upload straight to Appwrite Storage
+        // and use the returned public view URL the same way mediaUrl
+        // was used before -- everything downstream (Firestore
+        // 'statuses' doc, status card rendering) is unchanged.
+        mediaUrl = await uploadToAppwrite(STATUS_DRAFT.imageFile);
+      }
+
+      if (STATUS_DRAFT.editingId) {
+        await db.collection('statuses').doc(STATUS_DRAFT.editingId).update({ content, mediaUrl });
+        toast('Status updated.', 'success');
+      } else {
+        await db.collection('statuses').add({
+          userId: APP.user.id, username: APP.user.username, content, mediaUrl,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          expiresAt: expiryToDate(STATUS_DRAFT.expiry),
+        });
+        toast('Status posted.', 'success');
+      }
+    } else {
+      // ---- Local demo fallback ----
+      if (STATUS_DRAFT.editingId) {
+        const post = LOCAL_STATUSES.find(s => s.id === STATUS_DRAFT.editingId);
+        if (post) {
+          post.content = content;
+          post.mediaUrl = document.getElementById('statusMediaPreview').classList.contains('show')
+            ? document.getElementById('statusMediaPreviewImg').src : null;
+        }
+      } else {
+        LOCAL_STATUSES.unshift({
+          id: 'local_' + Date.now(), userId: APP.user.id, username: APP.user.username, content,
+          mediaUrl: document.getElementById('statusMediaPreview').classList.contains('show')
+            ? document.getElementById('statusMediaPreviewImg').src : null,
+          createdAt: new Date(), expiresAt: expiryToDate(STATUS_DRAFT.expiry),
+        });
+      }
+      renderStatuses();
+      toast(STATUS_DRAFT.editingId ? 'Status updated.' : 'Status posted.', 'success');
+    }
+    closeModal('statusModal');
+  } catch (e) {
+    toast(e.message || 'Could not post your status.', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteStatus(id) {
+  try {
+    if (canUseBackend()) {
+      await db.collection('statuses').doc(id).delete();
+    } else {
+      LOCAL_STATUSES = LOCAL_STATUSES.filter(s => s.id !== id);
+      renderStatuses();
+    }
+    toast('Status deleted.', 'info');
+  } catch (e) {
+    toast(e.message || 'Could not delete status.', 'error');
+  }
+}
+
+// Cache of the currently-rendered statuses (Firestore or local), kept
+// so openStatusComposer()/deleteStatus() can look a post up by id
+// without a second read.
+let LOCAL_STATUSES_CACHE = [];
+
+function renderStatusList(posts) {
+  LOCAL_STATUSES_CACHE = posts;
+  const wrap = document.getElementById('statusTimeline');
+  const visible = posts.filter(p => !p.expiresAt || p.expiresAt > new Date());
+  if (visible.length === 0) {
+    wrap.innerHTML = `<div class="list-empty-state status-empty"><i class="fa-solid fa-circle-notch"></i><div><strong>No statuses yet</strong><br><span>Post the first one -- it'll show up here for both of you.</span></div></div>`;
+    return;
+  }
+  wrap.innerHTML = visible.map(p => {
+    const mine = p.userId === APP.user.id;
+    const media = p.mediaUrl ? `<img class="status-card-media" src="${p.mediaUrl}" alt="Status photo">` : '';
+    const actions = mine ? `
+      <div class="status-actions">
+        <button onclick="openStatusComposer('${p.id}')" aria-label="Edit status"><i class="fa-solid fa-pen"></i></button>
+        <button class="danger" onclick="deleteStatus('${p.id}')" aria-label="Delete status"><i class="fa-solid fa-trash-can"></i></button>
+      </div>` : '';
+    return `
+      <div class="status-card">
+        <div class="status-card-head">
+          <div class="avatar">${initials(p.username)}</div>
+          <div>
+            <div class="status-card-name">${escapeHtml(p.username)}</div>
+            <div class="status-card-time">${timeAgo(p.createdAt)}</div>
+          </div>
+        </div>
+        ${p.content ? `<div class="status-card-content">${escapeHtml(p.content)}</div>` : ''}
+        ${media}
+        <div class="status-card-footer">
+          <span class="status-expiry-badge"><i class="fa-solid fa-clock"></i> ${expiryLabel(p.expiresAt)}</span>
+          ${actions}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderStatuses() {
+  // Local demo: sort newest first and render straight from memory.
+  const sorted = [...LOCAL_STATUSES].sort((a, b) => b.createdAt - a.createdAt);
+  renderStatusList(sorted);
+}
+
+function subscribeStatuses() {
+  if (!canUseBackend() || statusesUnsub) return;
+  statusesUnsub = db.collection('statuses').orderBy('createdAt', 'desc')
+    .onSnapshot(snap => {
+      const posts = [];
+      snap.forEach(doc => {
+        const d = doc.data();
+        posts.push({
+          id: doc.id, userId: d.userId, username: d.username, content: d.content,
+          mediaUrl: d.mediaUrl || null,
+          createdAt: d.createdAt ? d.createdAt.toDate() : new Date(),
+          expiresAt: d.expiresAt ? (d.expiresAt.toDate ? d.expiresAt.toDate() : new Date(d.expiresAt)) : null,
+        });
+      });
+      renderStatusList(posts);
+    }, err => console.warn('Mere: statuses listener failed', err));
+}
+function teardownStatuses() { if (statusesUnsub) statusesUnsub(); statusesUnsub = null; }
+
+/* ================================================================
+   WATCH TOGETHER (synced YouTube playback)
+   ------------------------------------------------------------
+   Firestore collection `syncState/{room}`: room, videoId, positionSec,
+   isPlaying, updatedBy, updatedAt. `room` is the same deterministic
+   pair id used for chats (chatIdFor), so both of you always read/write
+   the exact same doc regardless of who's "me".
+   Uses the official YouTube IFrame Player API (loaded lazily, only
+   once, the first time Watch Together is used).
+   ================================================================ */
+let wtPlayer = null;
+let wtRoom = null;
+let wtSyncUnsub = null;
+let wtApplyingRemote = false; // guards against our own remote-apply calls re-triggering a write
+let wtPositionPushTimer = null;
+let wtYoutubeApiReady = false;
+let wtPendingVideoId = null;
+
+function loadYoutubeApiOnce() {
+  if (window.YT && window.YT.Player) { wtYoutubeApiReady = true; return; }
+  if (document.getElementById('youtubeIframeApiScript')) return;
+  const tag = document.createElement('script');
+  tag.id = 'youtubeIframeApiScript';
+  tag.src = 'https://www.youtube.com/iframe_api';
+  document.head.appendChild(tag);
+}
+// The YouTube API calls this global function by name once it's ready --
+// it's part of the IFrame API's contract, not something we invoke ourselves.
+window.onYouTubeIframeAPIReady = function () {
+  wtYoutubeApiReady = true;
+  if (wtPendingVideoId) createWtPlayer(wtPendingVideoId);
+};
+
+function extractYoutubeId(input) {
+  const s = input.trim();
+  const patterns = [/(?:v=|\/embed\/|youtu\.be\/|\/shorts\/)([A-Za-z0-9_-]{11})/, /^([A-Za-z0-9_-]{11})$/];
+  for (const re of patterns) { const m = s.match(re); if (m) return m[1]; }
+  return null;
+}
+
+function createWtPlayer(videoId) {
+  document.getElementById('wtEmptyState').classList.add('hidden');
+  if (wtPlayer) { wtPlayer.loadVideoById(videoId); return; }
+  wtPlayer = new YT.Player('wtPlayerEl', {
+    videoId,
+    playerVars: { rel: 0, playsinline: 1 },
+    events: {
+      onStateChange: onWtPlayerStateChange,
+    },
+  });
+}
+
+function loadTogetherVideo() {
+  const raw = document.getElementById('wtUrlInput').value;
+  const videoId = extractYoutubeId(raw);
+  if (!videoId) return toast('Paste a valid YouTube link or 11-character video ID.', 'error');
+  wtRoom = wtRoom || chatIdFor(APP.user.id, getPartnerId() || 'solo');
+
+  if (!wtYoutubeApiReady) { wtPendingVideoId = videoId; loadYoutubeApiOnce(); }
+  else createWtPlayer(videoId);
+
+  pushSyncState({ videoId, positionSec: 0, isPlaying: false });
+  subscribeSyncState();
+}
+
+// Fired on every play/pause/seek/end from the LOCAL player -- pushes
+// our new state to Firestore so the other device can follow along,
+// unless this state change was itself just us applying a remote
+// update (see applyRemoteSyncState()).
+function onWtPlayerStateChange(e) {
+  if (wtApplyingRemote) return;
+  const isPlaying = e.data === YT.PlayerState.PLAYING;
+  document.getElementById('wtPlayBtn').innerHTML = isPlaying
+    ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+  if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
+    pushSyncState({ isPlaying, positionSec: Math.floor(wtPlayer.getCurrentTime()) });
+  }
+  // While playing, periodically broadcast position so a partner who
+  // joins mid-video (or drifted) can catch up without a big jump.
+  clearInterval(wtPositionPushTimer);
+  if (isPlaying) {
+    wtPositionPushTimer = setInterval(() => {
+      if (wtPlayer) pushSyncState({ isPlaying: true, positionSec: Math.floor(wtPlayer.getCurrentTime()) });
+    }, 4000);
+  }
+}
+
+function wtTogglePlay() {
+  if (!wtPlayer) return toast('Load a video first.', 'info');
+  const state = wtPlayer.getPlayerState();
+  if (state === YT.PlayerState.PLAYING) wtPlayer.pauseVideo(); else wtPlayer.playVideo();
+}
+function wtSeek(deltaSec) {
+  if (!wtPlayer) return;
+  const t = Math.max(0, wtPlayer.getCurrentTime() + deltaSec);
+  wtPlayer.seekTo(t, true);
+  pushSyncState({ positionSec: Math.floor(t) });
+}
+function wtResync() {
+  if (!wtRoom || !canUseBackend()) return toast('Nothing to re-sync yet.', 'info');
+  db.collection('syncState').doc(wtRoom).get().then(doc => {
+    if (doc.exists) applyRemoteSyncState(doc.data(), true);
+  });
+}
+
+function pushSyncState(partial) {
+  if (!canUseBackend() || !wtRoom) return;
+  db.collection('syncState').doc(wtRoom).set({
+    room: wtRoom, updatedBy: APP.user.id,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    ...partial,
+  }, { merge: true }).catch(() => {});
+}
+
+function subscribeSyncState() {
+  if (!canUseBackend() || !wtRoom || wtSyncUnsub) return;
+  wtSyncUnsub = db.collection('syncState').doc(wtRoom).onSnapshot(doc => {
+    if (!doc.exists) return;
+    const data = doc.data();
+    if (data.updatedBy === APP.user.id) return; // ignore our own writes echoing back
+    applyRemoteSyncState(data, false);
+  }, err => console.warn('Mere: syncState listener failed', err));
+}
+
+// Applies a Firestore syncState doc to the LOCAL player. `force`
+// (used by the manual re-sync button) always seeks; otherwise we only
+// seek if drift is more than 2 seconds, so small network jitter
+// doesn't cause a constant stutter of tiny seeks.
+function applyRemoteSyncState(data, force) {
+  if (!data.videoId) return;
+  wtApplyingRemote = true;
+  try {
+    if (!wtPlayer) {
+      if (!wtYoutubeApiReady) { wtPendingVideoId = data.videoId; loadYoutubeApiOnce(); }
+      else createWtPlayer(data.videoId);
+    } else {
+      const current = wtPlayer.getVideoData ? wtPlayer.getVideoData().video_id : null;
+      if (current !== data.videoId) wtPlayer.loadVideoById(data.videoId);
+      const drift = Math.abs(wtPlayer.getCurrentTime() - (data.positionSec || 0));
+      if (force || drift > 2) wtPlayer.seekTo(data.positionSec || 0, true);
+      if (data.isPlaying) wtPlayer.playVideo(); else wtPlayer.pauseVideo();
+    }
+    document.getElementById('wtPlayBtn').innerHTML = data.isPlaying
+      ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+    document.getElementById('wtStatusLine').textContent = 'Synced with your partner.';
+  } finally {
+    setTimeout(() => { wtApplyingRemote = false; }, 300);
+  }
+}
+function teardownTogether() {
+  if (wtSyncUnsub) wtSyncUnsub();
+  wtSyncUnsub = null;
+  clearInterval(wtPositionPushTimer);
+}
+
+/* ================================================================
+   HIGH-FIVE / VIBE CANNON
+   ------------------------------------------------------------
+   Firestore collection `highFives/{pairId}` (pairId = chatIdFor(a,b),
+   same deterministic-pair pattern as chats/syncState): senderId (of
+   the MOST RECENT high-five), receiverId, count, lastUpdated. One
+   shared counter per pair rather than one row per direction, since
+   the badge/counter is meant to represent "high-fives between you
+   two" as a whole.
+   ================================================================ */
+let hfUnsub = null;
+let hfLastSeenCount = 0;
+
+function sendHighFive() {
+  const partnerId = getPartnerId();
+  if (!partnerId) return toast('No one to high-five yet.', 'info');
+
+  fireConfettiBurst();
+
+  if (canUseBackend()) {
+    const pairId = chatIdFor(APP.user.id, partnerId);
+    db.collection('highFives').doc(pairId).set({
+      senderId: APP.user.id, receiverId: partnerId,
+      count: firebase.firestore.FieldValue.increment(1),
+      lastUpdated: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true }).catch(e => toast(e.message || 'High-five failed to send.', 'error'));
+  } else {
+    hfLastSeenCount += 1;
+    updateHighFiveUI(hfLastSeenCount, APP.user.id);
+    toast('High-five sent!', 'success');
+  }
+}
+
+function fireConfettiBurst() {
+  if (typeof confetti !== 'function') return;
+  confetti({ particleCount: 90, spread: 70, startVelocity: 38, origin: { y: 0.7 } });
+}
+
+function updateHighFiveUI(count, lastSenderId) {
+  document.getElementById('hfCount').textContent = String(count);
+  const badge = document.getElementById('hfHeaderBadge');
+  badge.textContent = String(count);
+  badge.classList.toggle('hidden', count === 0);
+  // If the LAST high-five came from the other person (not me), that's
+  // a notification worth surfacing -- the heads-up banner doubles as
+  // Mere's in-app "someone sent you a high-five" alert.
+  if (lastSenderId && lastSenderId !== APP.user.id && count > hfLastSeenCount) {
+    const sender = CONTACTS.find(c => c.id === lastSenderId);
+    showHeadsUpBanner(sender ? sender.name : 'Someone', 'sent you a high-five!');
+    fireConfettiBurst();
+  }
+  hfLastSeenCount = count;
+}
+
+// Subscribes to the running high-five count for whichever contact's
+// chat is currently open (see openChat()) and keeps both the header
+// badge and the Together page counter live-updated.
+function subscribeHighFives(contactId) {
+  if (!canUseBackend()) return;
+  if (hfUnsub) { hfUnsub(); hfUnsub = null; }
+  const partnerId = contactId || getPartnerId();
+  if (!partnerId) return;
+  const pairId = chatIdFor(APP.user.id, partnerId);
+  hfUnsub = db.collection('highFives').doc(pairId).onSnapshot(doc => {
+    const data = doc.exists ? doc.data() : { count: 0 };
+    updateHighFiveUI(data.count || 0, data.senderId);
+  }, err => console.warn('Mere: highFives listener failed', err));
+}
+function teardownHighFives() { if (hfUnsub) hfUnsub(); hfUnsub = null; }
+
+/* ================================================================
+   INPUT BAR ATTACHMENTS -- files, camera photos, and voice notes
+   ------------------------------------------------------------
+   All three flows below share the same shape: get a File/Blob from
+   the browser (file picker, camera input, or MediaRecorder), upload
+   it to Appwrite Storage via uploadToAppwrite() (see APPWRITE SETUP
+   near the top of this script), then drop the resulting URL into a
+   chat message using sendAttachmentMessage() -- which mirrors
+   sendMessage()'s real-chat/local-demo branching so attachments show
+   up exactly the way typed messages do, with no UI/CSS changes.
+   ================================================================ */
+
+// Shared by openAttachmentPicker(), openCameraCapture() and
+// startVoiceNote(): takes an already-uploaded file's URL and a short
+// human-readable label (e.g. "Photo", "File: report.pdf", "Voice
+// note"), and posts it into the currently open chat as a normal
+// message. The message content is just text containing the label and
+// URL -- per spec this file's rendering (renderMessageRowHTML) is not
+// being changed, so the URL shows as plain (but copyable/tappable-if-
+// the-OS-linkifies-it) text, same as any other message.
+async function sendAttachmentMessage(label, url) {
+  const contactId = APP.activeContact;
+  if (!contactId) { toast('Open a chat first.', 'error'); return; }
+  const text = `${label}: ${url}`;
+  const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+  if (contactId === 'mereai') {
+    // Mere AI's thread lives only in local MESSAGE_LOG (see
+    // sendMereAiMessage() above) -- an attachment sent to Mere AI is
+    // just recorded there as a "me" message; it isn't sent on to the
+    // GAS/Gemini backend since that endpoint only accepts a text
+    // prompt.
+    const log = MESSAGE_LOG['mereai'];
+    const msg = { from: 'me', text, ticks: 'read', time };
+    log.push(msg);
+    appendMessageDOM(msg, log.length - 1, true);
+    scrollChatToBottom();
+    renderContacts();
+    return;
+  }
+
+  if (isRealChat(contactId)) {
+    db.collection('messages').add({
+      chatId: chatIdFor(APP.user.id, contactId),
+      senderId: APP.user.id, receiverId: contactId, content: text,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      deliveredAt: null, readAt: null,
+    }).catch(e => toast(e.message || 'Attachment message failed to send.', 'error'));
+    // Same as sendMessage(): no optimistic local push, the
+    // subscribeToMessages() onSnapshot listener renders it.
+    return;
+  }
+
+  // ---- Local demo / demo-login fallback: mirrors sendMessage()'s fake progression. ----
+  const log = MESSAGE_LOG[contactId];
+  const msg = { from: 'me', text, ticks: 'sent', time };
+  log.push(msg);
+  const index = log.length - 1;
+  appendMessageDOM(msg, index, true);
+  scrollChatToBottom();
+  renderContacts();
+  setTimeout(() => updateMessageTickState(contactId, index, 'delivered'), 700);
+  setTimeout(() => updateMessageTickState(contactId, index, 'read'), 1600);
+}
+
+// Opens a native file picker (images or documents), uploads the pick
+// to Appwrite Storage, and sends it as an attachment message.
+function openAttachmentPicker() {
+  if (!APP.activeContact) { toast('Open a chat first.', 'error'); return; }
+  if (!appwriteStorage) { toast('File uploads are not configured yet.', 'error'); return; }
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  // Images and common document types -- broad enough to cover
+  // "photos and documents" without accepting arbitrary/unsafe files.
+  input.accept = 'image/*,.pdf,.doc,.docx,.txt,.zip';
+  input.style.display = 'none';
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    input.remove();
+    if (!file) return;
+    toast('Uploading attachment...', 'info');
+    try {
+      const url = await uploadToAppwrite(file);
+      const label = file.type.startsWith('image/') ? 'Photo' : `File: ${file.name}`;
+      await sendAttachmentMessage(label, url);
+      toast('Attachment sent.', 'success');
+    } catch (e) {
+      console.warn('Attachment upload failed', e);
+      toast('Could not upload that file. Please try again.', 'error');
+    }
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+
+// Opens the device camera directly (rather than a generic file
+// picker) via accept="image/*" + capture="environment", uploads the
+// photo to Appwrite Storage, and sends it as an attachment message.
+function openCameraCapture() {
+  if (!APP.activeContact) { toast('Open a chat first.', 'error'); return; }
+  if (!appwriteStorage) { toast('Camera uploads are not configured yet.', 'error'); return; }
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.capture = 'environment'; // hints mobile browsers to open the rear camera directly
+  input.style.display = 'none';
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    input.remove();
+    if (!file) return;
+    toast('Uploading photo...', 'info');
+    try {
+      const url = await uploadToAppwrite(file);
+      await sendAttachmentMessage('Photo', url);
+      toast('Photo sent.', 'success');
+    } catch (e) {
+      console.warn('Camera upload failed', e);
+      toast('Could not upload that photo. Please try again.', 'error');
+    }
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+
+// Tracks the in-progress MediaRecorder (if any) so a second tap on
+// the mic button stops/finalizes the recording instead of starting a
+// second one on top of it.
+let ACTIVE_VOICE_RECORDER = null;
+
+// Records audio via the MediaRecorder API. First tap requests mic
+// permission and starts recording (with a toast so the user knows
+// it's live); second tap stops it, uploads the resulting audio blob
+// to Appwrite Storage, and sends it as an attachment message.
+async function startVoiceNote() {
+  if (!APP.activeContact) { toast('Open a chat first.', 'error'); return; }
+  if (!appwriteStorage) { toast('Voice notes are not configured yet.', 'error'); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    toast('Voice recording is not supported in this browser.', 'error');
+    return;
+  }
+
+  // Second tap while already recording -- stop it.
+  if (ACTIVE_VOICE_RECORDER && ACTIVE_VOICE_RECORDER.state === 'recording') {
+    ACTIVE_VOICE_RECORDER.stop();
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    console.warn('Microphone access denied or unavailable', e);
+    toast('Microphone access is needed to record a voice note.', 'error');
+    return;
+  }
+
+  const chunks = [];
+  const recorder = new MediaRecorder(stream);
+  ACTIVE_VOICE_RECORDER = recorder;
+
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    // Always release the mic once recording stops, whether or not
+    // the upload below succeeds.
+    stream.getTracks().forEach(track => track.stop());
+    ACTIVE_VOICE_RECORDER = null;
+
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    if (blob.size === 0) { toast('Recording was empty -- nothing sent.', 'info'); return; }
+
+    toast('Uploading voice note...', 'info');
+    try {
+      // Appwrite's createFile() expects a File (not a bare Blob) to
+      // pick up a filename/type reliably across browsers.
+      const file = new File([blob], `voice-note-${Date.now()}.webm`, { type: blob.type });
+      const url = await uploadToAppwrite(file);
+      await sendAttachmentMessage('Voice note', url);
+      toast('Voice note sent.', 'success');
+    } catch (e) {
+      console.warn('Voice note upload failed', e);
+      toast('Could not upload that voice note. Please try again.', 'error');
+    }
+  };
+
+  recorder.start();
+  toast('Recording... tap the mic again to stop.', 'info');
+}
+
+/* ================================================================
+   MOBILE KEYBOARD HANDLING
+   ================================================================
+   Uses the VisualViewport API (supported across current mobile
+   browsers, iOS Safari included) to keep #chatScreen sized to
+   whatever space is actually visible above the on-screen keyboard --
+   so the input bar never ends up hidden behind it -- and to
+   auto-scroll the thread to the latest message once the keyboard
+   finishes animating open. #chatScreen's CSS `height:100dvh` is the
+   fallback for the rare browser with neither API.
+   ================================================================ */
+function setupKeyboardHandling() {
+  if (!window.visualViewport) return;
+  const vv = window.visualViewport;
+  const chatScreen = document.getElementById('chatScreen');
+  const chatInput = document.getElementById('chatInput');
+
+  function syncToViewport() {
+    if (!chatScreen.classList.contains('open')) return;
+    chatScreen.style.height = vv.height + 'px';
+    chatScreen.style.top = vv.offsetTop + 'px';
+    scrollChatToBottom();
+  }
+
+  vv.addEventListener('resize', syncToViewport);
+  vv.addEventListener('scroll', syncToViewport);
+
+  // The viewport resize can fire slightly before the on-screen
+  // keyboard's open animation actually finishes -- a short delay
+  // after focus avoids scrolling to a position that's about to shift.
+  chatInput.addEventListener('focus', () => setTimeout(syncToViewport, 300));
+}
+
+/* ================================================================
+   PRESENCE (Firebase Realtime Database)
+   ================================================================
+   Standard Firebase onDisconnect() pattern: as soon as this client
+   connects, it schedules an RTDB write for the moment it disconnects
+   (including crashes/closed tabs), then immediately marks itself
+   online. This keeps /status/{uid} accurate without any client-side
+   heartbeat or beforeunload hacks.
+   ================================================================ */
+let presenceRef = null, presenceConnectedRef = null;
+function setupPresence(uid) {
+  if (LOCAL_MODE || !rtdb) return;
+  presenceRef = rtdb.ref('/status/' + uid);
+  presenceConnectedRef = rtdb.ref('.info/connected');
+  presenceConnectedRef.on('value', (snap) => {
+    if (snap.val() === false) return;
+    presenceRef.onDisconnect().set({
+      state: 'offline', lastChanged: firebase.database.ServerValue.TIMESTAMP,
+    }).then(() => {
+      presenceRef.set({ state: 'online', lastChanged: firebase.database.ServerValue.TIMESTAMP });
+    });
+  });
+}
+function teardownPresence() {
+  if (presenceRef) presenceRef.set({ state: 'offline', lastChanged: firebase.database.ServerValue.TIMESTAMP });
+  if (presenceConnectedRef) presenceConnectedRef.off();
+  presenceRef = null; presenceConnectedRef = null;
+}
+
+/* ================================================================
+   NOTIFICATIONS (Web Notifications API + in-app heads-up banner)
+   ================================================================ */
+function requestNotificationPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    Notification.requestPermission().then(() => setupPushNotifications()).catch(() => {});
+  } else if (Notification.permission === 'granted') {
+    setupPushNotifications();
+  }
+}
+
+/* ================================================================
+   PUSH NOTIFICATIONS (Firebase Cloud Messaging)
+   ------------------------------------------------------------
+   Foreground messages (app open, tab focused) are shown as an
+   in-app heads-up banner via onMessage() below. Background/closed-app
+   messages are handled entirely by firebase-messaging-sw.js (the
+   service worker file that ships alongside this HTML file) -- there
+   is nothing more to wire up here for that case.
+
+   For a message to actually arrive as a push, something server-side
+   has to call the FCM Send API when a new `messages` doc is created.
+   See cloud-function.js (ships alongside this file) for that piece,
+   plus the "Any part of this too complex?" note in the deployment
+   summary for a no-code alternative.
+   ================================================================ */
+let pushSetupDone = false;
+async function setupPushNotifications() {
+  if (pushSetupDone || !messaging || !APP.user || LOCAL_MODE || APP.user.id.startsWith('demo_')) return;
+  if (VAPID_KEY === 'YOUR_VAPID_KEY') {
+    console.warn('Mere: VAPID_KEY is still a placeholder -- push notifications are disabled until you paste in a real key from Firebase Console > Project Settings > Cloud Messaging.');
+    return;
+  }
+  try {
+    // The service worker file MUST be named exactly this and sit next
+    // to index.html at the root of your deployment (see the
+    // DEPLOYMENT SUMMARY for Netlify specifics).
+    const registration = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
+    const token = await messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: registration });
+    if (token) await saveFcmToken(token);
+
+    // Foreground messages: FCM does NOT show a native OS notification
+    // by itself while the tab is focused (only the service worker does
+    // that for background messages), so we reuse the existing heads-up
+    // banner for a consistent in-app experience either way.
+    messaging.onMessage((payload) => {
+      const title = payload.notification?.title || 'Mere';
+      const body = payload.notification?.body || '';
+      showHeadsUpBanner(title, body);
+    });
+  } catch (e) {
+    console.warn('Mere: push notification setup failed.', e);
+  }
+}
+
+// Stores this device's token at users/{uid}/fcmTokens/{token} so the
+// Cloud Function (cloud-function.js) knows every token to send a given
+// user's messages to. Keyed by the token itself (not auto-ID) so
+// re-registering the same device is a harmless overwrite, not a
+// growing pile of duplicates.
+async function saveFcmToken(token) {
+  try {
+    await db.collection('users').doc(APP.user.id).collection('fcmTokens').doc(token).set({
+      token, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      userAgent: navigator.userAgent,
+    });
+  } catch (e) {
+    console.warn('Mere: could not save FCM token.', e);
+  }
+}
+
+let headsUpTimer = null;
+function showHeadsUpBanner(sender, message, senderInitials) {
+  const banner = document.getElementById('headsUpBanner');
+  document.getElementById('hbAvatar').textContent = senderInitials || initials(sender);
+  document.getElementById('hbSender').textContent = sender;
+  document.getElementById('hbMsg').textContent = message;
+  banner.classList.add('show');
+  clearTimeout(headsUpTimer);
+  headsUpTimer = setTimeout(dismissHeadsUp, 4000);
+}
+function dismissHeadsUp() {
+  document.getElementById('headsUpBanner').classList.remove('show');
+  clearTimeout(headsUpTimer);
+}
+
+function sendTestNotification() {
+  const sample = APP.user?.username === 'Demo Student'
+    ? { name: 'Destiny', text: 'New message!' }
+    : { name: 'Kuroh', text: 'Hey! Are you there?' };
+
+  showHeadsUpBanner(sample.name, sample.text, initials(sample.name));
+
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification(`${sample.name} - Mere`, { body: sample.text, icon: '' });
+  } else if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().then(p => {
+      if (p === 'granted') new Notification(`${sample.name} - Mere`, { body: sample.text });
+    });
+  }
+  toast('Test notification sent.', 'success');
+}
+
+/* ================================================================
+   SETTINGS: dark mode & theme color
+   ================================================================ */
+function toggleDark() {
+  APP.darkMode = !APP.darkMode;
+  document.body.setAttribute('data-dark', String(APP.darkMode));
+  document.getElementById('darkSwitch').classList.toggle('on', APP.darkMode);
+  document.getElementById('darkSwitch').setAttribute('aria-checked', String(APP.darkMode));
+  localStorage.setItem('mere_dark', String(APP.darkMode));
+}
+
+function setTheme(theme, el) {
+  APP.theme = theme;
+  document.body.setAttribute('data-theme', theme);
+  document.querySelectorAll('.tc').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  localStorage.setItem('mere_theme', theme);
+}
+
+/* ================================================================
+   OTP INPUT AUTO-FOCUS BEHAVIOUR
+   ================================================================ */
+function wireOtpInputs() {
+  const digits = Array.from(document.querySelectorAll('.otp-digit'));
+  digits.forEach((input, i) => {
+    input.addEventListener('input', () => {
+      input.value = input.value.replace(/[^0-9]/g, '').slice(0, 1);
+      if (input.value && digits[i + 1]) digits[i + 1].focus();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Backspace' && !input.value && digits[i - 1]) digits[i - 1].focus();
+    });
+    input.addEventListener('paste', (e) => {
+      const text = (e.clipboardData || window.clipboardData).getData('text').replace(/[^0-9]/g, '');
+      if (text.length) {
+        e.preventDefault();
+        text.split('').slice(0, 6).forEach((ch, idx) => { if (digits[idx]) digits[idx].value = ch; });
+        digits[Math.min(text.length, 6) - 1]?.focus();
+      }
+    });
+  });
+}
+
+/* ================================================================
+   INIT
+   ================================================================ */
+document.addEventListener('DOMContentLoaded', () => {
+  wireOtpInputs();
+  setupKeyboardHandling();
+
+  // Restore saved theme / dark mode preference.
+  const savedTheme = localStorage.getItem('mere_theme');
+  if (savedTheme) {
+    APP.theme = savedTheme;
+    document.body.setAttribute('data-theme', savedTheme);
+    document.querySelectorAll('.tc').forEach(c => c.classList.toggle('active', c.dataset.t === savedTheme));
+  }
+  const savedDark = localStorage.getItem('mere_dark') === 'true';
+  if (savedDark) {
+    APP.darkMode = true;
+    document.body.setAttribute('data-dark', 'true');
+    document.getElementById('darkSwitch').classList.add('on');
+    document.getElementById('darkSwitch').setAttribute('aria-checked', 'true');
+  }
+
+  // Auto sign-in if a session was persisted (Remember Me).
+  // LOCAL_MODE and demo-login accounts are restored synchronously from
+  // localStorage/sessionStorage. Real Firebase sessions are restored
+  // via onAuthStateChanged, which fires once on load with the user
+  // Firebase Auth already has persisted (per the LOCAL/SESSION choice
+  // made at sign-in time) -- or null if there is none.
+  if (restoreSession()) {
+    enterApp();
+  } else if (!LOCAL_MODE) {
+    auth.onAuthStateChanged(async (fbUser) => {
+      if (APP.user) return; // already entered via restoreSession above
+      if (!fbUser) { requestNotificationPermission(); return; }
+      try {
+        const profileSnap = await db.collection('users').doc(fbUser.uid).get();
+        const profile = profileSnap.exists ? profileSnap.data() : null;
+        if (profile && profile.emailVerified === false) {
+          // Signed into Firebase but never finished OTP verification.
+          requestNotificationPermission();
+          return;
+        }
+        APP.user = { id: fbUser.uid, username: profile?.username || fbUser.displayName || fbUser.email, email: fbUser.email };
+        enterApp();
+      } catch (e) {
+        requestNotificationPermission();
+      }
+    });
+  } else {
+    requestNotificationPermission();
+  }
+});
+</script>
+</body>
+</html>
