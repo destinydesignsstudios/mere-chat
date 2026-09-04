@@ -1,10 +1,19 @@
 /* ================================================================
    Mere -- AI assistant backend (Netlify Function, replaces Code.gs)
    ------------------------------------------------------------
-   Receives { prompt } as a POST body from askMereAi() in index.html
-   and returns { reply: "..." }. Runs on the same Netlify site as
-   the app itself, so there's no cross-service round trip and no
-   cold-start delay the way there was calling out to Apps Script.
+   Receives { messages } as a POST body from askMereAi()/
+   callMereAiBackend() in index.html -- messages is the recent
+   conversation history as [{ role: 'user'|'assistant', content }],
+   built by buildAiHistory() -- and returns { reply: "..." }. Runs on
+   the same Netlify site as the app itself, so there's no
+   cross-service round trip and no cold-start delay the way there
+   was calling out to Apps Script.
+
+   Sending the whole recent history (not just the newest message) on
+   every call is what gives the assistant conversation memory --
+   Groq, like any chat completion API, has no memory of its own
+   between requests; the illusion of memory comes entirely from the
+   caller re-sending prior turns each time.
 
    The Groq API key never appears in any file in this project -- it
    lives only in Netlify's environment variables (Site settings ->
@@ -19,20 +28,37 @@
 // console.groq.com/docs/models for whatever's current.
 const GROQ_MODEL = 'openai/gpt-oss-120b';
 
+// Optional personality/context for the assistant. Edit this to
+// change how Mere AI responds -- e.g. its name, tone, or anything
+// it should always know. Kept server-side so it can't be edited or
+// removed from the browser.
+const SYSTEM_PROMPT = 'You are Mere AI, a helpful, friendly assistant built into the Mere messaging app. Keep replies conversational and concise.';
+
 exports.handler = async function (event) {
   if (event.httpMethod !== 'POST') {
     return jsonResponse(405, { error: 'Method not allowed.' });
   }
 
-  let prompt;
+  let messages;
   try {
     const body = JSON.parse(event.body || '{}');
-    prompt = (body.prompt || '').toString().trim();
+    if (Array.isArray(body.messages) && body.messages.length > 0) {
+      // Expected shape going forward: the client sends the recent
+      // conversation history directly.
+      messages = body.messages
+        .filter(m => m && typeof m.content === 'string' && m.content.trim() && (m.role === 'user' || m.role === 'assistant'))
+        .map(m => ({ role: m.role, content: m.content.trim() }));
+    } else if (typeof body.prompt === 'string' && body.prompt.trim()) {
+      // Backwards-compatible fallback for a single-prompt request
+      // (no history) -- shouldn't normally be hit anymore, but kept
+      // so an older cached copy of the client doesn't hard-fail.
+      messages = [{ role: 'user', content: body.prompt.trim() }];
+    }
   } catch (e) {
     return jsonResponse(400, { error: 'Invalid JSON body.' });
   }
-  if (!prompt) {
-    return jsonResponse(400, { error: 'Missing "prompt".' });
+  if (!messages || messages.length === 0) {
+    return jsonResponse(400, { error: 'Missing "messages" (or "prompt").' });
   }
 
   const apiKey = process.env.GROQ_API_KEY;
@@ -49,7 +75,7 @@ exports.handler = async function (event) {
       },
       body: JSON.stringify({
         model: GROQ_MODEL,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
       }),
     });
 
